@@ -207,5 +207,11 @@ if st.button("生成 & スコアリング（CSV出力つき）"):
         st.subheader("🏁 ランキング（CSVにダウンロード可能）")
         st.dataframe(df, use_container_width=True)
 
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ CSVダウンロード", data=csv, file_name="rq_ranked_with_links.csv", mime="text/csv")
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+
+        st.download_button(
+            "⬇️ CSVダウンロード（UTF-8対応）",
+            data=csv,
+            file_name="rq_ranked_with_links.csv",
+            mime="text/csv"
+        )
