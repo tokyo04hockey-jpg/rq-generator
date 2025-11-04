@@ -1,11 +1,11 @@
-# streamlit_app.py  — OpenAI SDK v1 用
+# streamlit_app.py — OpenAI SDK v1 対応版（旧API完全排除）
 import streamlit as st
 from openai import OpenAI
 
 st.title("🎓 Research Question Generator")
 st.write("パネル/インタビュー要約から4視点（逆張り/飛ばし/トレードオフ幻像/アナロジー）で研究クエスチョンを生成します。")
 
-# Secrets に OPENAI_API_KEY を "KEY=VALUE" のTOML形式で設定済みであること
+# Secrets で OPENAI_API_KEY="sk-..." を設定しておくこと
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
 summary = st.text_area("議論の要約を入力してください", height=200)
@@ -23,6 +23,7 @@ if st.button("クエスチョンを生成"):
 内容: {summary}
 """
         with st.spinner("生成中..."):
+            # ✅ 新API: client.chat.completions.create(...)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
