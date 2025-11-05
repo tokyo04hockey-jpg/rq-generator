@@ -1,5 +1,6 @@
 streamlit>=1.32
-openai>=1.30
+beautifulsoup4
+openai>=1.40.0
 pandas>=1.0
 requests>=2.31
 tabulate>=0.9
