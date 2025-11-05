@@ -27,8 +27,13 @@ def openalex_count(query: str) -> int:
 
 @st.cache_data(show_spinner=False, ttl=600)
 def openalex_top_links(query: str, n: int = 3) -> list[dict]:
-    """関連上位論文のリンクとタイトルを返す（OpenAlex/DOI）"""
-    url = f"https://api.openalex.org/works?search={quote(query)}&per_page={n}&sort=cited_by_count:desc"
+    base = "https://api.openalex.org/works"
+    params = (
+        f"title.search={quote(query)}"
+        "&filter=type:journal-article,language:en,from_publication_date:2015-01-01"
+        f"&per_page={n}&sort=cited_by_count:desc"
+    )
+    url = f"{base}?{params}"
     try:
         r = requests.get(url, timeout=10)
         r.raise_for_status()
