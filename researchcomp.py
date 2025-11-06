@@ -21,7 +21,7 @@ from urllib3.util.retry import Retry
 from urllib.parse import urlencode, urlparse
 
 # =========================
-# 設定（Secrets を優先。UIは出さない）
+# 設定（Secrets/環境変数を利用。UIは出さない）
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
 GOOGLE_CSE_ID  = st.secrets.get("GOOGLE_CSE_ID",  os.getenv("GOOGLE_CSE_ID",  ""))
@@ -49,7 +49,7 @@ def _build_session() -> requests.Session:
 
 SESSION = _build_session()
 REQUEST_TIMEOUT = 12  # 20→12 に短縮
-EXEC = ThreadPoolExecutor(max_workers=24)  # マシンに合わせて8〜32程度
+EXEC = ThreadPoolExecutor(max_workers=24)  # マシンに合わせて8〜32程度推奨
 
 # =========================
 # ユーティリティ
@@ -57,12 +57,12 @@ EXEC = ThreadPoolExecutor(max_workers=24)  # マシンに合わせて8〜32程�
 def _strip_html(raw: str) -> str:
     if not raw:
         return ""
-    raw = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", raw)
+    raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
     text = re.sub(r"(?s)<[^>]+>", " ", raw)
     text = html.unescape(text)
     text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"[ \\t\\r\\f\\v]+", " ", text)
-    text = re.sub(r"\\n+", "\\n", text)
+    text = re.sub(r"[ \t\r\f\v]+", " ", text)
+    text = re.sub(r"\n+", "\n", text)
     return text.strip()
 
 def _domain_score(url: str) -> int:
@@ -127,7 +127,7 @@ TASKS = {
 }
 
 def _queries_for(company: str) -> Dict[str, List[str]]:
-    quoted = f"\\"{company.strip()}\\""
+    quoted = f'"{company.strip()}"'
     return {
         "CVC": [
             f"{quoted} CVC コーポレートベンチャーキャピタル 立ち上げ 投資子会社",
@@ -202,14 +202,14 @@ def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max
     return out
 
 # =========================
-# 会社名フィット・スコアリング（高速版）
+# 会社名フィット・スコアリング（他社優勢を除外）
 # =========================
 JP_CORP_SUFFIXES = ["株式会社", "（株）", "(株)", "ホールディングス", "ホールディングス株式会社", "グループ", "グループ株式会社"]
 EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorporated", "Corporation", "Corp.", "Holdings", "Group", "Limited", "Ltd."]
 
 def _normalize_name(n: str) -> str:
     s = unicodedata.normalize("NFKC", n or "").strip()
-    s = re.sub(r"\\s+", " ", s)
+    s = re.sub(r"\s+", " ", s)
     return s
 
 def _strip_corp_words(n: str) -> str:
@@ -217,8 +217,8 @@ def _strip_corp_words(n: str) -> str:
     for w in JP_CORP_SUFFIXES: s = s.replace(w, "")
     for w in EN_CORP_SUFFIXES: s = s.replace(w, "")
     s = s.replace("Kabushiki Kaisha", "").replace("K.K.", "")
-    s = re.sub(r"[.,・／/|｜\\\\\\-‐-–—~〜()\\[\\]{}＜＞<>]", " ", s)
-    s = re.sub(r"\\s+", "", s).lower()
+    s = re.sub(r"[.,・／/|｜\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
+    s = re.sub(r"\s+", "", s).lower()
     return s
 
 def _variants_for_target(company: str) -> List[str]:
@@ -229,10 +229,10 @@ def _variants_for_target(company: str) -> List[str]:
     return list({_strip_corp_words(x) for x in v})
 
 COMPANY_PATTERNS = [
-    r"株式会社\\s*([^\\s、。：「」『』()（）【】\\n]{1,30})",
-    r"([^\\s、。：「」『』()（）【】\\n]{1,30})\\s*株式会社",
-    r"（株）\\s*([^\\s、。：「」『』()（）【】\\n]{1,30})",
-    r"([A-Z][A-Za-z0-9&.\\- ]{1,60})\\s+(?:Co\\.?\\,?\\s*Ltd\\.?|Inc\\.|Corporation|Corp\\.|Holdings|Group|Limited|Ltd\\.)",
+    r"株式会社\s*([^\s、。：「」『』()（）【】\n]{1,30})",
+    r"([^\s、。：「」『』()（）【】\n]{1,30})\s*株式会社",
+    r"（株）\s*([^\s、。：「」『』()（）【】\n]{1,30})",
+    r"([A-Z][A-Za-z0-9&.\- ]{1,60})\s+(?:Co\.?,?\s*Ltd\.?|Inc\.|Corporation|Corp\.|Holdings|Group|Limited|Ltd\.)",
 ]
 
 def _extract_company_like_names(text: str) -> List[str]:
@@ -253,8 +253,8 @@ def _company_fit_score_for_item(company: str, title: str, snippet: str, body: st
     snip_norm  = unicodedata.normalize("NFKC", snippet or "")
     joined     = unicodedata.normalize("NFKC", " ".join([title or "", snippet or "", body or ""]))
 
-    title_search = _strip_corp_words(title_norm)
-    snip_search  = _strip_corp_words(snip_norm)
+    title_search  = _strip_corp_words(title_norm)
+    snip_search   = _strip_corp_words(snip_norm)
     joined_search = _strip_corp_words(joined)
 
     def count_target_in(normed: str) -> int:
@@ -285,6 +285,7 @@ def filter_evidence_by_company(company: str, evidence_enriched: Dict[str, List[D
         scored.sort(key=lambda x: x[0], reverse=True)
         kept = []
         for s, tgt_cnt, it, _ in scored:
+            # 条件：ターゲット出現≥1 & スコア≥1
             if tgt_cnt >= 1 and s >= 1.0:
                 kept.append(it)
         out[task] = kept
@@ -325,11 +326,11 @@ Decision hygiene (company-specific):
 Definitions and decision rules (apply strictly):
 - CVC: The company has its own corporate venture capital arm or investment subsidiary (e.g., 'CVC', 'corporate venture capital', 'investment subsidiary', 'capital partners'). One-off venture investments without a dedicated arm → do NOT mark 'Yes'.
 - LP: The company has committed capital as a limited partner to an external venture fund (e.g., 'LP', 'limited partner', 'commitment', '出資', 'リミテッドパートナー'). If only investing directly as a CVC without LP commitment, mark 'No' (unless LP is also evidenced).
-- Synergy (AI_Robotics / Healthcare / Climate): For AI_Robotics, **mark 'Yes' if there is evidence for either AI OR Robotics (either one suffices)**. For Healthcare/Climate, require concrete ties (products/partnerships/investments/pilots/strategic focus).
+- Synergy (AI_Robotics / Healthcare / Climate): For AI_Robotics, mark 'Yes' if there is evidence for either AI OR Robotics (either one suffices). For Healthcare/Climate, require concrete ties (products/partnerships/investments/pilots/strategic focus).
 
 Hard constraints:
 - Output must be valid JSON (UTF-8, no trailing commas, no comments).
-- For each task, set 'label' ∈ {{'Yes','No','Unclear'}}, 'confidence' ∈ [0,1].
+- For each task, set 'label' ∈ {'Yes','No','Unclear'}, 'confidence' ∈ [0,1].
 - 'reason_ja': ≤100 Japanese characters. 'reason_en': 1–2 sentences English.
 - 'evidence_urls': include up to 3 URLs, but ONLY from the provided evidence links. Do NOT invent URLs.
 - If signals conflict or are outdated without follow-ups, prefer 'Unclear'.
@@ -337,16 +338,16 @@ Hard constraints:
 - If no relevant evidence, use 'Unclear' with confidence 0.2.
 
 Return JSON in the exact schema:
-{{
-  "per_task": {{
-    "CVC":         {{"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}},
-    "LP":          {{"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}},
-    "AI_Robotics": {{"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}},
-    "Healthcare":  {{"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}},
-    "Climate":     {{"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}}
-  }},
-  "x_post": {{"jp":"","en":""}}
-}}
+{
+  "per_task": {
+    "CVC":         {"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]},
+    "LP":          {"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]},
+    "AI_Robotics": {"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]},
+    "Healthcare":  {"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]},
+    "Climate":     {"label":"","confidence":0.0,"reason_ja":"","reason_en":"","evidence_urls":[]}
+  },
+  "x_post": {"jp":"","en":""}
+}
 
 Evidence (grouped by task). Each item has fields: title, link, body (first hundreds of characters).
 {evidence_json}
@@ -356,7 +357,7 @@ def _safe_json_loads(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
-        m = re.search(r"\\{.*\\}\\s*$", text, re.S)
+        m = re.search(r"\{.*\}\s*$", text, re.S)
         if m:
             try:
                 return json.loads(m.group(0))
@@ -376,7 +377,7 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         model=MODEL_REASON,
         temperature=0.0,
         max_output_tokens=900,  # 1500→900
-        input=f"System:\\n{PROMPT_SYSTEM}\\n\\nUser:\\n{prompt_user}",
+        input=f"System:\n{PROMPT_SYSTEM}\n\nUser:\n{prompt_user}",
     )
     text = resp.output_text
     data = _safe_json_loads(text)
@@ -385,8 +386,8 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
             model=MODEL_REASON,
             temperature=0.0,
             max_output_tokens=900,
-            input=("System:\\n" + PROMPT_SYSTEM + "\\n\\nUser:\\nReturn ONLY valid JSON per the schema. "
-                   "If previous attempt failed, correct and resend the JSON.\\n" + prompt_user),
+            input=("System:\n" + PROMPT_SYSTEM + "\n\nUser:\nReturn ONLY valid JSON per the schema. "
+                   "If previous attempt failed, correct and resend the JSON.\n" + prompt_user),
         )
         text = resp2.output_text
         data = _safe_json_loads(text)
@@ -440,10 +441,10 @@ cols = st.columns(4)
 with cols[0]:
     uploaded = st.file_uploader("Excel をアップロード（C列=会社名）", type=["xlsx", "xls"])
 with cols[1]:
-    # 上限 50 / デフォルト 50
-    limit = st.number_input("処理件数の上限（最大50）", min_value=1, max_value=50, value=50, step=1)
+    # 上限 500 / デフォルト 50
+    limit = st.number_input("処理件数の上限（最大500）", min_value=1, max_value=500, value=50, step=1)
 with cols[2]:
-    # デフォルトを軽めの3に（速度改善）。必要なら変更可
+    # デフォルトを軽めの3（速度優先）。必要に応じて変更可
     max_sources = st.slider("各タスクの最大参照URL数", 1, 8, 3)
 with cols[3]:
     checkpoint_every = st.number_input("自動保存（社ごと）", 1, 50, 25, 5)
