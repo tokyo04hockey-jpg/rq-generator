@@ -3,14 +3,13 @@ import os
 import re
 import time
 import json
-import math
 import html
 import traceback
 import requests
 import pandas as pd
 import streamlit as st
 from urllib.parse import urlencode, urlparse
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any
 from collections import defaultdict
 
 # =========================
@@ -26,44 +25,35 @@ OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""
 # pip install openai>=1.0.0
 from openai import OpenAI
 _oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-
 MODEL_REASON = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1-mini")
 
 # =========================
 # ユーティリティ
 # =========================
 SAFE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.0; +https://example.org)"
+    "User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.0)"
 }
 REQUEST_TIMEOUT = 20
 
 def _strip_html(raw: str) -> str:
-    # 超軽量の HTML → プレーンテキスト化
+    """超軽量の HTML → プレーンテキスト化"""
     if not raw:
         return ""
-    # スクリプト/スタイル除去
     raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
-    # タグを潰す
     text = re.sub(r"(?s)<[^>]+>", " ", raw)
     text = html.unescape(text)
-    # 余分な空白整形
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n+", "\n", text)
     return text.strip()
 
 def _domain_score(url: str) -> int:
-    """
-    公式っぽい or リリース/IR を優先。
-    スコア大きいほど優先。
-    """
+    """公式/IR/PR を優先する簡易スコア"""
     host = urlparse(url).netloc.lower()
     score = 0
     if host.endswith(".co.jp") or host.endswith(".com"):
         score += 1
-    # プレス・IR ドメイン
-    if any(k in host for k in ["ir.", "prtimes.jp", "prtimes.co.jp", "news.", "press"]):
+    if any(k in host for k in ["ir.", "prtimes.jp", "news.", "press"]):
         score += 2
-    # 公式サイトの /news, /ir, /press
     if any(p in url.lower() for p in ["/ir", "/investor", "/press", "/news", "/release"]):
         score += 2
     return score
@@ -111,7 +101,6 @@ def google_search(q: str, num: int = 6) -> List[Dict[str, str]]:
             "link": it.get("link",""),
             "snippet": it.get("snippet",""),
         })
-    # 公式/IR/PRっぽさでソート
     items.sort(key=lambda x: _domain_score(x["link"]), reverse=True)
     return _dedup_urls(items, max_per_domain=2)
 
@@ -121,7 +110,6 @@ def fetch_text(url: str, max_chars: int = 4000) -> str:
         r = requests.get(url, headers=SAFE_HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
         text = _strip_html(r.text)
-        # 日本語サイトの「関連記事」等ノイズを軽く削る
         text = re.sub(r"(?i)この記事|関連記事|おすすめ|シェア|同社|編集部|注意事項", " ", text)
         return text[:max_chars]
     except Exception:
@@ -139,7 +127,7 @@ TASKS = {
 }
 
 def _queries_for(company: str) -> Dict[str, List[str]]:
-    # 日英 + シノニムを含むクエリ束
+    """日英 + シノニムを含むクエリ束を作成"""
     return {
         "CVC": [
             f"{company} CVC コーポレートベンチャーキャピタル 立ち上げ 投資子会社",
@@ -186,9 +174,7 @@ def gather_evidence(company: str, per_query_limit: int = 6, per_task_urls: int =
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max_sources_per_task: int = 5) -> Dict[str, List[Dict[str, str]]]:
-    """
-    各 URL から本文（先頭数千文字）を取得して evidence に埋め込む。
-    """
+    """各 URL から本文（先頭数千文字）を取得して evidence に埋め込む"""
     out: Dict[str, List[Dict[str, str]]] = {}
     for task, items in evidence.items():
         enriched = []
@@ -209,7 +195,7 @@ def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max
 # =========================
 PROMPT_SYSTEM = (
     "You are an analyst of corporate–startup collaboration. "
-    "Return STRICT JSON **only** with the exact schema requested. "
+    "Return STRICT JSON only with the exact schema requested. "
     "Be conservative: choose 'Unclear' unless there is direct evidence."
 )
 
@@ -224,7 +210,7 @@ Definitions and decision rules (apply strictly):
 
 Hard constraints:
 - Output must be valid JSON (UTF-8, no trailing commas, no comments).
-- For each task, set 'label' ∈ {'Yes','No','Unclear'}, 'confidence' ∈ [0,1].
+- For each task, set 'label' ∈ {{'Yes','No','Unclear'}}, 'confidence' ∈ [0,1].
 - 'reason_ja': ≤100 Japanese characters. 'reason_en': 1–2 sentences English.
 - 'evidence_urls': include up to 3 URLs, but ONLY from the provided evidence links. Do NOT invent URLs.
 - If signals are mixed or decade-old without follow-ups, prefer 'Unclear'.
@@ -251,7 +237,6 @@ def _safe_json_loads(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
-        # 先頭/末尾にゴミが付くケースの簡易修正
         m = re.search(r"\{.*\}\s*$", text, re.S)
         if m:
             try:
@@ -266,8 +251,9 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
 
     prompt_user = PROMPT_USER_TEMPLATE.format(
         company=company,
-        evidence_json=json.dumps(evidence_enriched, ensure_ascii=False)[:120000]  # 念のためトークン抑制
+        evidence_json=json.dumps(evidence_enriched, ensure_ascii=False)[:120000]
     )
+
     # 1回目
     resp = _oai.responses.create(
         model=MODEL_REASON,
@@ -276,8 +262,8 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         input=f"System:\n{PROMPT_SYSTEM}\n\nUser:\n{prompt_user}",
     )
     text = resp.output_text
-
     data = _safe_json_loads(text)
+
     # パース失敗 or 欠損が大きい場合は 1 回だけ再試行
     if not data or "per_task" not in data:
         resp2 = _oai.responses.create(
@@ -349,8 +335,8 @@ if run and uploaded:
     progress = st.progress(0.0)
     status = st.empty()
 
-    tabs_collect = st.tabs(["進捗", "最終テーブル", "詳細ログ"])
-    with tabs_collect[0]:
+    tabs = st.tabs(["進捗", "最終テーブル", "詳細ログ"])
+    with tabs[0]:
         st.write("検索→本文取得→判定を順に実行します。")
 
     detail_log = []
@@ -405,7 +391,6 @@ if run and uploaded:
             }
             rows.append(row)
 
-            # 詳細ログ（参照URL抜粋）
             detail_log.append({
                 "company": company,
                 "evidence": ev_enriched,
@@ -420,20 +405,20 @@ if run and uploaded:
 
     out = pd.DataFrame(rows)
 
-    with tabs_collect[1]:
+    with tabs[1]:
         st.success("完了！")
         st.dataframe(out, use_container_width=True)
         csv = out.to_csv(index=False)
         st.download_button("CSVをダウンロード", data=csv, file_name="corporate_fit_with_reasons.csv", mime="text/csv")
 
-    with tabs_collect[2]:
+    with tabs[2]:
         for block in detail_log:
             with st.expander(f"🔍 {block.get('company')} の詳細"):
                 if "error" in block:
                     st.error(block["error"])
                     st.code(block.get("trace",""))
                 else:
-                    st.markdown("**参照された Evidence（各タスク 上位数件）**")
+                    st.markdown("**参照 Evidence（各タスク 上位）**")
                     for task, items in block["evidence"].items():
                         st.markdown(f"- **{task}**")
                         for it in items:
