@@ -7,6 +7,7 @@ import html
 import base64
 import traceback
 import unicodedata
+import io
 import requests
 import pandas as pd
 import streamlit as st
@@ -15,7 +16,7 @@ from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
 
 # =========================
-# 設定（Secrets を優先。ただしUIは出さない）
+# 設定（Secrets を優先。UIには出さない）
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
 GOOGLE_CSE_ID  = st.secrets.get("GOOGLE_CSE_ID",  os.getenv("GOOGLE_CSE_ID",  ""))
@@ -24,15 +25,14 @@ OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""
 # =========================
 # OpenAI (Responses API)
 # =========================
-# pip install openai>=1.0.0
-from openai import OpenAI
+from openai import OpenAI  # pip install openai>=1.0.0
 _oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 MODEL_REASON = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1-mini")
 
 # =========================
 # ユーティリティ
 # =========================
-SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.2)"}
+SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.3)"}
 REQUEST_TIMEOUT = 20
 
 def _strip_html(raw: str) -> str:
@@ -144,7 +144,7 @@ def gather_evidence(company: str, per_query_limit: int = 6, per_task_urls: int =
     for k, qlist in queries.items():
         bucket = []
         for q in qlist:
-            time.sleep(0.25)
+            time.sleep(0.2)
             bucket.extend(google_search(q, num=per_query_limit))
         seen = set(); uniq = []
         for it in bucket:
@@ -167,37 +167,31 @@ def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max
     return out
 
 # =========================
-# 会社名フィット・スコアリング（除外リスト不要）
+# 会社名フィット・スコアリング
 # =========================
 JP_CORP_SUFFIXES = ["株式会社", "（株）", "(株)", "ホールディングス", "ホールディングス株式会社", "グループ", "グループ株式会社"]
 EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorporated", "Corporation", "Corp.", "Holdings", "Group", "Limited", "Ltd."]
 
 def _normalize_name(n: str) -> str:
-    s = unicodedata.normalize("NFKC", n or "")
-    s = s.strip()
+    s = unicodedata.normalize("NFKC", n or "").strip()
     s = re.sub(r"\s+", " ", s)
     return s
 
 def _strip_corp_words(n: str) -> str:
     s = n
-    for w in JP_CORP_SUFFIXES:
-        s = s.replace(w, "")
-    for w in EN_CORP_SUFFIXES:
-        s = s.replace(w, "")
+    for w in JP_CORP_SUFFIXES: s = s.replace(w, "")
+    for w in EN_CORP_SUFFIXES: s = s.replace(w, "")
     s = s.replace("Kabushiki Kaisha", "").replace("K.K.", "")
-    s = re.sub(r"[.,・／/|｜\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
+    s = re.sub(r"[.,・／/|｜\\\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
     s = re.sub(r"\s+", "", s).lower()
     return s
 
 def _variants_for_target(company: str) -> List[str]:
     base = _normalize_name(company)
     v = {base}
-    if base.startswith("株式会社"):
-        v.add(base.replace("株式会社", "", 1).strip())
-    if base.endswith("株式会社"):
-        v.add(base.replace("株式会社", "").strip())
-    v2 = {_strip_corp_words(x) for x in v}
-    return list(v2)
+    if base.startswith("株式会社"): v.add(base.replace("株式会社", "", 1).strip())
+    if base.endswith("株式会社"):   v.add(base.replace("株式会社", "").strip())
+    return list({_strip_corp_words(x) for x in v})
 
 COMPANY_PATTERNS = [
     r"株式会社\s*([^\s、。：「」『』()（）【】\n]{1,30})",
@@ -254,8 +248,7 @@ def filter_evidence_by_company(company: str, evidence_enriched: Dict[str, List[D
             scored.append((s, tgt_body_cnt, it, others))
         scored.sort(key=lambda x: x[0], reverse=True)
         kept = []
-        for s, tgt_cnt, it, others in scored:
-            # 条件：本文/タイトル/スニペットの正規化後にターゲット≥1、かつスコア>=1
+        for s, tgt_cnt, it, _ in scored:
             if tgt_cnt >= 1 and s >= 1.0:
                 kept.append(it)
         out[task] = kept
@@ -366,30 +359,57 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         return skeleton
 
 # =========================
-# Streamlit UI（Secretsセクションなし） + 自動ダウンロード
+# ダウンロード支援ユーティリティ
+# =========================
+def _to_b64_csv(df: pd.DataFrame) -> str:
+    csv = df.to_csv(index=False)
+    return base64.b64encode(csv.encode("utf-8")).decode()
+
+def _auto_download(b64: str, filename: str):
+    st.components.v1.html(
+        f"""
+        <html><body>
+        <a id="autodl" href="data:text/csv;base64,{b64}" download="{filename}"></a>
+        <script>document.getElementById('autodl').click();</script>
+        </body></html>
+        """,
+        height=0,
+    )
+
+# =========================
+# Streamlit UI（Secrets セクションなし）
 # =========================
 st.set_page_config(page_title="Corporate–Startup Fit Checker+", layout="wide")
 st.title("🏢➡️🤝🚀 Corporate–Startup Fit Checker+")
-st.caption("C列=会社名。Google CSEで証跡→本文取得→会社名スコアで他社記事を除外→OpenAIで判定。Xドラフト付き。")
+st.caption("C列=会社名。証跡→本文取得→会社名スコアで他社記事を除外→OpenAIで判定。中間CSVを自動保存。")
 
-cols = st.columns(3)
+cols = st.columns(4)
 with cols[0]:
     uploaded = st.file_uploader("Excel をアップロード（C列=会社名）", type=["xlsx", "xls"])
 with cols[1]:
-    limit = st.number_input("処理件数の上限", 1, 5000, 50, 10)
+    limit = st.number_input("処理件数の上限", 1, 20000, 200, 50)
 with cols[2]:
     max_sources = st.slider("各タスクの最大参照URL数", 1, 8, 5)
+with cols[3]:
+    checkpoint_every = st.number_input("自動保存（社ごと）", 1, 200, 25, 5)
+
+# ▼ アップロードの永続化（セッション内）
+if uploaded is not None:
+    st.session_state["uploaded_bytes"] = uploaded.getvalue()
+    st.session_state["uploaded_name"] = getattr(uploaded, "name", "input.xlsx")
 
 # 自動DLの一回制御
 if "auto_dl_done" not in st.session_state:
     st.session_state.auto_dl_done = False
-if "last_csv_b64" not in st.session_state:
-    st.session_state.last_csv_b64 = ""
 
-run = st.button("解析スタート", type="primary", disabled=uploaded is None)
+run = st.button("解析スタート", type="primary", disabled=("uploaded_bytes" not in st.session_state))
 
-if run and uploaded:
-    df = pd.read_excel(uploaded)
+if run and ("uploaded_bytes" in st.session_state):
+    # セッションから読み直し（途中再実行でも継続可能）
+    data_bytes = st.session_state["uploaded_bytes"]
+    filelike = io.BytesIO(data_bytes)
+
+    df = pd.read_excel(filelike)
     if df.shape[1] >= 3:
         companies = df.iloc[:, 2].dropna().astype(str).tolist()
     else:
@@ -399,11 +419,12 @@ if run and uploaded:
     rows = []
     progress = st.progress(0.0)
     status = st.empty()
-    tabs = st.tabs(["進捗", "最終テーブル", "詳細ログ"])
+    tabs = st.tabs(["進捗", "最終テーブル / ダウンロード", "詳細ログ"])
     with tabs[0]:
-        st.write("検索→本文取得→会社名フィルタ→判定の順で実行します。")
+        st.write("検索→本文取得→会社名フィルタ→判定をループ。一定社数ごとに自動でCSV保存します。")
 
     detail_log = []
+    st.session_state.auto_dl_done = False  # 新規開始ごとにリセット
 
     for i, company in enumerate(companies, 1):
         status.info(f"Searching & analyzing: {company}")
@@ -455,44 +476,36 @@ if run and uploaded:
             rows.append({"company": company, "error": str(e)})
             detail_log.append({"company": company, "error": str(e), "trace": traceback.format_exc()})
 
+        # 進捗更新（サーバ・ブラウザ双方のアイドル切断回避に有効）
         progress.progress(i/len(companies))
-        time.sleep(0.05)
+        time.sleep(0.02)
 
+        # ▼ チェックポイント保存・自動DL（一定社数ごと）
+        if i % int(checkpoint_every) == 0:
+            partial_df = pd.DataFrame(rows)
+            b64 = _to_b64_csv(partial_df)
+            _auto_download(b64, f"corporate_fit_checkpoint_{i:05d}.csv")
+            with tabs[1]:
+                st.toast(f"中間CSV（{i}社時点）を自動ダウンロードしました。", icon="✅")
+                st.dataframe(partial_df.tail(20), use_container_width=True)
+
+    # ===== 最終結果 =====
     out = pd.DataFrame(rows)
-    csv = out.to_csv(index=False)
-    b64 = base64.b64encode(csv.encode("utf-8")).decode()
-    st.session_state.last_csv_b64 = b64
-    st.session_state.auto_dl_done = False  # 新規生成のたびに再DL可に
-
     with tabs[1]:
-        st.success("完了！")
+        st.success("解析完了！")
         st.dataframe(out, use_container_width=True)
 
-        # 手動ダウンロード（保険）
+        csv_b64 = _to_b64_csv(out)
+        # 手動DL（保険）
         st.download_button(
-            "CSVをダウンロード",
-            data=csv,
+            "最終CSVをダウンロード",
+            data=base64.b64decode(csv_b64),
             file_name="corporate_fit_with_reasons.csv",
             mime="text/csv",
         )
-
-        # 自動ダウンロード（1回だけ）
-        if not st.session_state.auto_dl_done and st.session_state.last_csv_b64:
-            st.session_state.auto_dl_done = True
-            st.components.v1.html(
-                f"""
-                <html><body>
-                <a id="autodl" href="data:text/csv;base64,{st.session_state.last_csv_b64}"
-                   download="corporate_fit_with_reasons.csv"></a>
-                <script>
-                  const a = document.getElementById('autodl');
-                  if (a) a.click();
-                </script>
-                </body></html>
-                """,
-                height=0,
-            )
-            st.info("CSV を自動ダウンロードしました。ブラウザがブロックした場合は上のボタンから保存してください。")
+        # 自動DL（最終）
+        _auto_download(csv_b64, "corporate_fit_with_reasons.csv")
+        st.info("最終CSVを自動ダウンロードしました。ブロックされた場合はボタンから保存してください。")
 
     with tabs[2]:
         for block in detail_log:
