@@ -1,22 +1,27 @@
 # app.py
 import os
 import re
+import io
 import time
 import json
 import html
 import base64
 import traceback
 import unicodedata
-import io
-import requests
-import pandas as pd
-import streamlit as st
-from urllib.parse import urlencode, urlparse
 from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import pandas as pd
+import streamlit as st
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from urllib.parse import urlencode, urlparse
 
 # =========================
-# 設定（Secrets を優先。UIには出さない）
+# 設定（Secrets を優先。UIは出さない）
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
 GOOGLE_CSE_ID  = st.secrets.get("GOOGLE_CSE_ID",  os.getenv("GOOGLE_CSE_ID",  ""))
@@ -25,25 +30,39 @@ OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""
 # =========================
 # OpenAI (Responses API)
 # =========================
-from openai import OpenAI  # pip install openai>=1.0.0
+# pip install openai>=1.0.0
+from openai import OpenAI
 _oai = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 MODEL_REASON = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1-mini")
 
 # =========================
+# 高速化：HTTP セッション & 並列実行器
+# =========================
+def _build_session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=0.3, status_forcelist=(429, 500, 502, 503, 504))
+    adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100, max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    s.headers.update({"User-Agent": "Mozilla/5.0 (CorporateStartupFit/1.6)"})
+    return s
+
+SESSION = _build_session()
+REQUEST_TIMEOUT = 12  # 20→12 に短縮
+EXEC = ThreadPoolExecutor(max_workers=24)  # マシンに合わせて8〜32程度
+
+# =========================
 # ユーティリティ
 # =========================
-SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.4)"}
-REQUEST_TIMEOUT = 20
-
 def _strip_html(raw: str) -> str:
     if not raw:
         return ""
-    raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
+    raw = re.sub(r"(?is)<(script|style).*?>.*?</\\1>", " ", raw)
     text = re.sub(r"(?s)<[^>]+>", " ", raw)
     text = html.unescape(text)
     text = unicodedata.normalize("NFKC", text)
-    text = re.sub(r"[ \t\r\f\v]+", " ", text)
-    text = re.sub(r"\n+", "\n", text)
+    text = re.sub(r"[ \\t\\r\\f\\v]+", " ", text)
+    text = re.sub(r"\\n+", "\\n", text)
     return text.strip()
 
 def _domain_score(url: str) -> int:
@@ -67,7 +86,7 @@ def _dedup_urls(items: List[Dict[str, str]], max_per_domain: int = 3) -> List[Di
     return out
 
 # =========================
-# Google Custom Search
+# Google Custom Search（並列）
 # =========================
 @st.cache_data(show_spinner=False, ttl=60*60)
 def google_search(q: str, num: int = 6) -> List[Dict[str, str]]:
@@ -83,26 +102,21 @@ def google_search(q: str, num: int = 6) -> List[Dict[str, str]]:
         "safe": "off",
     }
     url = f"https://www.googleapis.com/customsearch/v1?{urlencode(params)}"
-    r = requests.get(url, timeout=REQUEST_TIMEOUT)
+    r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     j = r.json()
     items = [{"title": it.get("title",""), "link": it.get("link",""), "snippet": it.get("snippet","")} for it in j.get("items", [])]
     items.sort(key=lambda x: _domain_score(x["link"]), reverse=True)
     return _dedup_urls(items, max_per_domain=2)
 
-@st.cache_data(show_spinner=False, ttl=60*60)
-def fetch_text(url: str, max_chars: int = 5000) -> str:
+def _search_one(q: str, num: int):
     try:
-        r = requests.get(url, headers=SAFE_HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        text = _strip_html(r.text)
-        text = re.sub(r"(?i)この記事|関連記事|おすすめ|シェア|同社|編集部|注意事項", " ", text)
-        return text[:max_chars]
+        return google_search(q, num=num)
     except Exception:
-        return ""
+        return []
 
 # =========================
-# Evidence 収集
+# Evidence 収集（並列検索）
 # =========================
 TASKS = {
     "CVC": "CVCを立ち上げているか",
@@ -113,7 +127,7 @@ TASKS = {
 }
 
 def _queries_for(company: str) -> Dict[str, List[str]]:
-    quoted = f"\"{company.strip()}\""
+    quoted = f"\\"{company.strip()}\\""
     return {
         "CVC": [
             f"{quoted} CVC コーポレートベンチャーキャピタル 立ち上げ 投資子会社",
@@ -138,14 +152,15 @@ def _queries_for(company: str) -> Dict[str, List[str]]:
     }
 
 @st.cache_data(show_spinner=False, ttl=60*60)
-def gather_evidence(company: str, per_query_limit: int = 6, per_task_urls: int = 6) -> Dict[str, List[Dict[str, str]]]:
+def gather_evidence(company: str, per_query_limit: int = 4, per_task_urls: int = 6) -> Dict[str, List[Dict[str, str]]]:
+    # per_query_limit: 6→4 に削減（速度優先）
     queries = _queries_for(company)
     ev_raw: Dict[str, List[Dict[str, str]]] = {}
     for k, qlist in queries.items():
+        futures = [EXEC.submit(_search_one, q, per_query_limit) for q in qlist]
         bucket = []
-        for q in qlist:
-            time.sleep(0.2)
-            bucket.extend(google_search(q, num=per_query_limit))
+        for f in as_completed(futures):
+            bucket.extend(f.result())
         seen = set(); uniq = []
         for it in bucket:
             u = it["link"]
@@ -154,27 +169,47 @@ def gather_evidence(company: str, per_query_limit: int = 6, per_task_urls: int =
         ev_raw[k] = uniq[:per_task_urls]
     return ev_raw
 
+# =========================
+# 本文取得（並列 & 短縮 & URLキャッシュ）
+# =========================
+@st.cache_data(show_spinner=False, ttl=60*60)
+def _fetch_text_cached(url: str, max_chars: int = 2000) -> str:
+    # 5000→2000 chars（速度＆LLMトークン節約）
+    try:
+        r = SESSION.get(url, timeout=REQUEST_TIMEOUT)
+        r.raise_for_status()
+        text = _strip_html(r.text)
+        text = re.sub(r"(?i)この記事|関連記事|おすすめ|シェア|同社|編集部|注意事項", " ", text)
+        return text[:max_chars]
+    except Exception:
+        return ""
+
 @st.cache_data(show_spinner=False, ttl=60*60)
 def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max_sources_per_task: int = 5) -> Dict[str, List[Dict[str, str]]]:
     out: Dict[str, List[Dict[str, str]]] = {}
     for task, items in evidence.items():
+        urls = [it["link"] for it in items[:max_sources_per_task]]
+        futures = {EXEC.submit(_fetch_text_cached, u): u for u in urls}
+        bodies = {}
+        for f in as_completed(futures):
+            u = futures[f]
+            bodies[u] = f.result()
         enriched = []
         for it in items[:max_sources_per_task]:
-            url = it["link"]
-            body = fetch_text(url, max_chars=5000)
-            enriched.append({"title": it.get("title",""), "link": url, "snippet": it.get("snippet",""), "body": body})
+            u = it["link"]
+            enriched.append({"title": it.get("title",""), "link": u, "snippet": it.get("snippet",""), "body": bodies.get(u, "")})
         out[task] = enriched
     return out
 
 # =========================
-# 会社名フィット・スコアリング
+# 会社名フィット・スコアリング（高速版）
 # =========================
 JP_CORP_SUFFIXES = ["株式会社", "（株）", "(株)", "ホールディングス", "ホールディングス株式会社", "グループ", "グループ株式会社"]
 EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorporated", "Corporation", "Corp.", "Holdings", "Group", "Limited", "Ltd."]
 
 def _normalize_name(n: str) -> str:
     s = unicodedata.normalize("NFKC", n or "").strip()
-    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"\\s+", " ", s)
     return s
 
 def _strip_corp_words(n: str) -> str:
@@ -182,8 +217,8 @@ def _strip_corp_words(n: str) -> str:
     for w in JP_CORP_SUFFIXES: s = s.replace(w, "")
     for w in EN_CORP_SUFFIXES: s = s.replace(w, "")
     s = s.replace("Kabushiki Kaisha", "").replace("K.K.", "")
-    s = re.sub(r"[.,・／/|｜\\\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
-    s = re.sub(r"\s+", "", s).lower()
+    s = re.sub(r"[.,・／/|｜\\\\\\-‐-–—~〜()\\[\\]{}＜＞<>]", " ", s)
+    s = re.sub(r"\\s+", "", s).lower()
     return s
 
 def _variants_for_target(company: str) -> List[str]:
@@ -194,10 +229,10 @@ def _variants_for_target(company: str) -> List[str]:
     return list({_strip_corp_words(x) for x in v})
 
 COMPANY_PATTERNS = [
-    r"株式会社\s*([^\s、。：「」『』()（）【】\n]{1,30})",
-    r"([^\s、。：「」『』()（）【】\n]{1,30})\s*株式会社",
-    r"（株）\s*([^\s、。：「」『』()（）【】\n]{1,30})",
-    r"([A-Z][A-Za-z0-9&.\- ]{1,60})\s+(?:Co\.?,?\s*Ltd\.?|Inc\.|Corporation|Corp\.|Holdings|Group|Limited|Ltd\.)",
+    r"株式会社\\s*([^\\s、。：「」『』()（）【】\\n]{1,30})",
+    r"([^\\s、。：「」『』()（）【】\\n]{1,30})\\s*株式会社",
+    r"（株）\\s*([^\\s、。：「」『』()（）【】\\n]{1,30})",
+    r"([A-Z][A-Za-z0-9&.\\- ]{1,60})\\s+(?:Co\\.?\\,?\\s*Ltd\\.?|Inc\\.|Corporation|Corp\\.|Holdings|Group|Limited|Ltd\\.)",
 ]
 
 def _extract_company_like_names(text: str) -> List[str]:
@@ -212,23 +247,24 @@ def _extract_company_like_names(text: str) -> List[str]:
 
 def _company_fit_score_for_item(company: str, title: str, snippet: str, body: str) -> Tuple[float, Counter, int]:
     target_vars = _variants_for_target(company)
-    title_n = unicodedata.normalize("NFKC", title or "")
-    snip_n  = unicodedata.normalize("NFKC", snippet or "")
-    body_n  = unicodedata.normalize("NFKC", body or "")
 
-    def count_target(s: str) -> int:
-        c = 0
-        s_norm = _strip_corp_words(s)
-        for tv in target_vars:
-            if not tv: continue
-            c += len(re.findall(re.escape(tv), s_norm, flags=re.IGNORECASE))
-        return c
+    # まとめて正規化
+    title_norm = unicodedata.normalize("NFKC", title or "")
+    snip_norm  = unicodedata.normalize("NFKC", snippet or "")
+    joined     = unicodedata.normalize("NFKC", " ".join([title or "", snippet or "", body or ""]))
 
-    title_hit = count_target(title_n) > 0
-    snip_hit  = count_target(snip_n)  > 0
-    body_cnt  = count_target(body_n)
+    title_search = _strip_corp_words(title_norm)
+    snip_search  = _strip_corp_words(snip_norm)
+    joined_search = _strip_corp_words(joined)
 
-    names = _extract_company_like_names(body_n + " " + title_n)
+    def count_target_in(normed: str) -> int:
+        return sum(len(re.findall(re.escape(tv), normed, flags=re.IGNORECASE)) for tv in target_vars if tv)
+
+    title_hit = count_target_in(title_search) > 0
+    snip_hit  = count_target_in(snip_search)  > 0
+    body_cnt  = count_target_in(joined_search)
+
+    names = _extract_company_like_names(joined)  # 一度だけ抽出
     other_counter = Counter()
     for n in names:
         norm = _strip_corp_words(n)
@@ -253,6 +289,21 @@ def filter_evidence_by_company(company: str, evidence_enriched: Dict[str, List[D
                 kept.append(it)
         out[task] = kept
     return out
+
+# =========================
+# LLM 入力を圧縮
+# =========================
+def _shrink_evidence(evidence: Dict[str, List[Dict[str, str]]], topk=3, body_chars=600):
+    slim = {}
+    for k, items in evidence.items():
+        slim[k] = []
+        for it in items[:topk]:
+            slim[k].append({
+                "title": it.get("title",""),
+                "link": it.get("link",""),
+                "body": (it.get("body","")[:body_chars])
+            })
+    return slim
 
 # =========================
 # OpenAI Reasoning
@@ -297,7 +348,7 @@ Return JSON in the exact schema:
   "x_post": {{"jp":"","en":""}}
 }}
 
-Evidence (grouped by task). Each item has fields: title, link, snippet, body (first kilobytes of fetched page).
+Evidence (grouped by task). Each item has fields: title, link, body (first hundreds of characters).
 {evidence_json}
 """
 
@@ -305,7 +356,7 @@ def _safe_json_loads(text: str) -> dict:
     try:
         return json.loads(text)
     except Exception:
-        m = re.search(r"\{.*\}\s*$", text, re.S)
+        m = re.search(r"\\{.*\\}\\s*$", text, re.S)
         if m:
             try:
                 return json.loads(m.group(0))
@@ -316,15 +367,16 @@ def _safe_json_loads(text: str) -> dict:
 def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
     if not _oai:
         return {}
+    slim = _shrink_evidence(evidence_enriched, topk=3, body_chars=600)
     prompt_user = PROMPT_USER_TEMPLATE.format(
         company=company,
-        evidence_json=json.dumps(evidence_enriched, ensure_ascii=False)[:120000]
+        evidence_json=json.dumps(slim, ensure_ascii=False)[:40000]  # 120000→40000
     )
     resp = _oai.responses.create(
         model=MODEL_REASON,
         temperature=0.0,
-        max_output_tokens=1500,
-        input=f"System:\n{PROMPT_SYSTEM}\n\nUser:\n{prompt_user}",
+        max_output_tokens=900,  # 1500→900
+        input=f"System:\\n{PROMPT_SYSTEM}\\n\\nUser:\\n{prompt_user}",
     )
     text = resp.output_text
     data = _safe_json_loads(text)
@@ -332,9 +384,9 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         resp2 = _oai.responses.create(
             model=MODEL_REASON,
             temperature=0.0,
-            max_output_tokens=1500,
-            input=("System:\n" + PROMPT_SYSTEM + "\n\nUser:\nReturn ONLY valid JSON per the schema. "
-                   "If previous attempt failed, correct and resend the JSON.\n" + prompt_user),
+            max_output_tokens=900,
+            input=("System:\\n" + PROMPT_SYSTEM + "\\n\\nUser:\\nReturn ONLY valid JSON per the schema. "
+                   "If previous attempt failed, correct and resend the JSON.\\n" + prompt_user),
         )
         text = resp2.output_text
         data = _safe_json_loads(text)
@@ -362,7 +414,6 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
 # ダウンロード支援（Excel 文字化け対策: UTF-8-SIG）
 # =========================
 def _to_csv_bytes_utf8sig(df: pd.DataFrame) -> bytes:
-    # Excelの文字化けを避けるため UTF-8 with BOM（utf-8-sig）で出力
     csv_text = df.to_csv(index=False)
     return csv_text.encode("utf-8-sig")
 
@@ -381,18 +432,19 @@ def _auto_download_csv_bytes(csv_bytes: bytes, filename: str):
 # =========================
 # Streamlit UI（Secrets セクションなし）
 # =========================
-st.set_page_config(page_title="Corporate–Startup Fit Checker+", layout="wide")
-st.title("🏢➡️🤝🚀 Corporate–Startup Fit Checker+")
-st.caption("C列=会社名。証跡→本文取得→会社名スコアで他社記事を除外→OpenAIで判定。中間CSVを自動保存（Excel向けUTF-8 BOM）。")
+st.set_page_config(page_title="Corporate–Startup Fit Checker+ (Fast)", layout="wide")
+st.title("🏢➡️🤝🚀 Corporate–Startup Fit Checker+ (Fast)")
+st.caption("並列検索/取得・HTTP再利用・LLM入力圧縮。C列=会社名。中間CSVと最終CSVをUTF-8 BOMで自動保存。")
 
 cols = st.columns(4)
 with cols[0]:
     uploaded = st.file_uploader("Excel をアップロード（C列=会社名）", type=["xlsx", "xls"])
 with cols[1]:
-    # ▶ 上限 50（最大値も50、デフォルトも50）
+    # 上限 50 / デフォルト 50
     limit = st.number_input("処理件数の上限（最大50）", min_value=1, max_value=50, value=50, step=1)
 with cols[2]:
-    max_sources = st.slider("各タスクの最大参照URL数", 1, 8, 5)
+    # デフォルトを軽めの3に（速度改善）。必要なら変更可
+    max_sources = st.slider("各タスクの最大参照URL数", 1, 8, 3)
 with cols[3]:
     checkpoint_every = st.number_input("自動保存（社ごと）", 1, 50, 25, 5)
 
@@ -404,7 +456,6 @@ if uploaded is not None:
 run = st.button("解析スタート", type="primary", disabled=("uploaded_bytes" not in st.session_state))
 
 if run and ("uploaded_bytes" in st.session_state):
-    # セッションから読み直し
     data_bytes = st.session_state["uploaded_bytes"]
     filelike = io.BytesIO(data_bytes)
 
@@ -413,7 +464,6 @@ if run and ("uploaded_bytes" in st.session_state):
         companies = df.iloc[:, 2].dropna().astype(str).tolist()
     else:
         companies = df.iloc[:, -1].dropna().astype(str).tolist()
-    # 上限 50 で切る
     companies = companies[:int(limit)]
 
     rows = []
@@ -428,7 +478,7 @@ if run and ("uploaded_bytes" in st.session_state):
     for i, company in enumerate(companies, 1):
         status.info(f"Searching & analyzing: {company}")
         try:
-            ev = gather_evidence(company)
+            ev = gather_evidence(company, per_query_limit=4, per_task_urls=6)
             ev_enriched = hydrate_evidence_with_content(ev, max_sources_per_task=max_sources)
             ev_enriched = filter_evidence_by_company(company, ev_enriched)
             reasoning = ask_openai_reasoning(company, ev_enriched) if OPENAI_API_KEY else {"per_task": {}, "x_post": {"jp":"", "en":""}}
@@ -440,16 +490,19 @@ if run and ("uploaded_bytes" in st.session_state):
 
             row = {
                 "company": company,
+                # ラベル
                 "CVC":        cell("CVC", "label", "Unclear"),
                 "LP":         cell("LP", "label", "Unclear"),
                 "AI_Robotics":cell("AI_Robotics", "label", "Unclear"),
                 "Healthcare": cell("Healthcare", "label", "Unclear"),
                 "Climate":    cell("Climate", "label", "Unclear"),
+                # 信頼度
                 "CVC_conf":        cell("CVC", "confidence", ""),
                 "LP_conf":         cell("LP", "confidence", ""),
                 "AI_Robotics_conf":cell("AI_Robotics", "confidence", ""),
                 "Healthcare_conf": cell("Healthcare", "confidence", ""),
                 "Climate_conf":    cell("Climate", "confidence", ""),
+                # 理由（日/英）
                 "CVC_reason_ja":        cell("CVC", "reason_ja", ""),
                 "LP_reason_ja":         cell("LP", "reason_ja", ""),
                 "AI_Robotics_reason_ja":cell("AI_Robotics", "reason_ja", ""),
@@ -460,11 +513,13 @@ if run and ("uploaded_bytes" in st.session_state):
                 "AI_Robotics_reason_en":cell("AI_Robotics", "reason_en", ""),
                 "Healthcare_reason_en": cell("Healthcare", "reason_en", ""),
                 "Climate_reason_en":    cell("Climate", "reason_en", ""),
+                # URL（最大3件を;区切りで）
                 "CVC_urls":        "; ".join(per_task.get("CVC", {}).get("evidence_urls", [])),
                 "LP_urls":         "; ".join(per_task.get("LP", {}).get("evidence_urls", [])),
                 "AI_Robotics_urls":"; ".join(per_task.get("AI_Robotics", {}).get("evidence_urls", [])),
                 "Healthcare_urls": "; ".join(per_task.get("Healthcare", {}).get("evidence_urls", [])),
                 "Climate_urls":    "; ".join(per_task.get("Climate", {}).get("evidence_urls", [])),
+                # X
                 "x_post_jp": x_post.get("jp", ""),
                 "x_post_en": x_post.get("en", "")
             }
@@ -476,9 +531,9 @@ if run and ("uploaded_bytes" in st.session_state):
             detail_log.append({"company": company, "error": str(e), "trace": traceback.format_exc()})
 
         progress.progress(i/len(companies))
-        time.sleep(0.02)
+        time.sleep(0.01)  # 軽いスリープでUI活性化
 
-        # ▼ チェックポイント保存・自動DL（一定社数ごと、UTF-8-SIG）
+        # ▼ チェックポイント保存・自動DL（UTF-8-SIG）
         if i % int(checkpoint_every) == 0:
             partial_df = pd.DataFrame(rows)
             csv_bytes = _to_csv_bytes_utf8sig(partial_df)
@@ -493,7 +548,6 @@ if run and ("uploaded_bytes" in st.session_state):
         st.success("解析完了！")
         st.dataframe(out, use_container_width=True)
 
-        # 手動DL（Excel 文字化けしない UTF-8-SIG）
         final_csv_bytes = _to_csv_bytes_utf8sig(out)
         st.download_button(
             "最終CSVをダウンロード（UTF-8 BOM）",
@@ -501,7 +555,6 @@ if run and ("uploaded_bytes" in st.session_state):
             file_name="corporate_fit_with_reasons.csv",
             mime="text/csv",
         )
-        # 自動DL（UTF-8-SIG）
         _auto_download_csv_bytes(final_csv_bytes, "corporate_fit_with_reasons.csv")
         st.info("最終CSVを自動ダウンロードしました。ブロックされた場合はボタンから保存してください。")
 
