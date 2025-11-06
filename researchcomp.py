@@ -4,6 +4,7 @@ import re
 import time
 import json
 import html
+import base64
 import traceback
 import unicodedata
 import requests
@@ -14,7 +15,7 @@ from typing import List, Dict, Any, Tuple
 from collections import defaultdict, Counter
 
 # =========================
-# 設定（Secrets を優先）
+# 設定（Secrets を優先。ただしUIは出さない）
 # =========================
 GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.getenv("GOOGLE_API_KEY", ""))
 GOOGLE_CSE_ID  = st.secrets.get("GOOGLE_CSE_ID",  os.getenv("GOOGLE_CSE_ID",  ""))
@@ -31,7 +32,7 @@ MODEL_REASON = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1-mini")
 # =========================
 # ユーティリティ
 # =========================
-SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.1)"}
+SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.2)"}
 REQUEST_TIMEOUT = 20
 
 def _strip_html(raw: str) -> str:
@@ -112,7 +113,6 @@ TASKS = {
 }
 
 def _queries_for(company: str) -> Dict[str, List[str]]:
-    # 会社名を引用符で固定し、混入を下げる（除外リストは使わない）
     quoted = f"\"{company.strip()}\""
     return {
         "CVC": [
@@ -167,7 +167,7 @@ def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max
     return out
 
 # =========================
-# 会社名フィット・スコアリング（リスト不要）
+# 会社名フィット・スコアリング（除外リスト不要）
 # =========================
 JP_CORP_SUFFIXES = ["株式会社", "（株）", "(株)", "ホールディングス", "ホールディングス株式会社", "グループ", "グループ株式会社"]
 EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorporated", "Corporation", "Corp.", "Holdings", "Group", "Limited", "Ltd."]
@@ -175,7 +175,6 @@ EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorp
 def _normalize_name(n: str) -> str:
     s = unicodedata.normalize("NFKC", n or "")
     s = s.strip()
-    # 前置/後置の株式会社などを除去した版も作るため、ここでは軽めに統一（両方で比較）
     s = re.sub(r"\s+", " ", s)
     return s
 
@@ -185,8 +184,7 @@ def _strip_corp_words(n: str) -> str:
         s = s.replace(w, "")
     for w in EN_CORP_SUFFIXES:
         s = s.replace(w, "")
-    s = s.replace("Kabushiki Kaisha", "")
-    s = s.replace("K.K.", "")
+    s = s.replace("Kabushiki Kaisha", "").replace("K.K.", "")
     s = re.sub(r"[.,・／/|｜\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
     s = re.sub(r"\s+", "", s).lower()
     return s
@@ -194,18 +192,13 @@ def _strip_corp_words(n: str) -> str:
 def _variants_for_target(company: str) -> List[str]:
     base = _normalize_name(company)
     v = {base}
-    # 「株式会社◯◯」「◯◯株式会社」を両取り
     if base.startswith("株式会社"):
         v.add(base.replace("株式会社", "", 1).strip())
     if base.endswith("株式会社"):
         v.add(base.replace("株式会社", "").strip())
-    # スペース・記号除去の正規化
-    v2 = set()
-    for x in v:
-        v2.add(_strip_corp_words(x))
+    v2 = {_strip_corp_words(x) for x in v}
     return list(v2)
 
-# 企業名らしき表現を本文から抽出（JP/ENの素朴な正規表現）
 COMPANY_PATTERNS = [
     r"株式会社\s*([^\s、。：「」『』()（）【】\n]{1,30})",
     r"([^\s、。：「」『』()（）【】\n]{1,30})\s*株式会社",
@@ -218,33 +211,29 @@ def _extract_company_like_names(text: str) -> List[str]:
     names = []
     for pat in COMPANY_PATTERNS:
         for m in re.findall(pat, text):
-            if isinstance(m, tuple):
-                m = m[0]
+            if isinstance(m, tuple): m = m[0]
             nm = _normalize_name(m)
-            if 1 <= len(nm) <= 60:
-                names.append(nm)
+            if 1 <= len(nm) <= 60: names.append(nm)
     return names
 
-def _company_fit_score_for_item(company: str, title: str, snippet: str, body: str) -> Tuple[float, Counter]:
-    target_vars = _variants_for_target(company)  # 例：{"共同印刷", "共同印刷"} → 正規化済み
+def _company_fit_score_for_item(company: str, title: str, snippet: str, body: str) -> Tuple[float, Counter, int]:
+    target_vars = _variants_for_target(company)
     title_n = unicodedata.normalize("NFKC", title or "")
     snip_n  = unicodedata.normalize("NFKC", snippet or "")
     body_n  = unicodedata.normalize("NFKC", body or "")
 
-    # 出現カウント（ターゲット）
     def count_target(s: str) -> int:
         c = 0
+        s_norm = _strip_corp_words(s)
         for tv in target_vars:
-            # 簡易：企業接尾辞を外したキーで連続一致数を数える
             if not tv: continue
-            c += len(re.findall(re.escape(tv), _strip_corp_words(s), flags=re.IGNORECASE))
+            c += len(re.findall(re.escape(tv), s_norm, flags=re.IGNORECASE))
         return c
 
     title_hit = count_target(title_n) > 0
     snip_hit  = count_target(snip_n)  > 0
     body_cnt  = count_target(body_n)
 
-    # 他社候補の抽出とカウント
     names = _extract_company_like_names(body_n + " " + title_n)
     other_counter = Counter()
     for n in names:
@@ -253,30 +242,21 @@ def _company_fit_score_for_item(company: str, title: str, snippet: str, body: st
             other_counter[norm] += 1
     max_other = max(other_counter.values()) if other_counter else 0
 
-    # スコア
     score = (2 if title_hit else 0) + (1 if snip_hit else 0) + body_cnt - 2 * max_other
-    return score, other_counter
+    return score, other_counter, body_cnt
 
 def filter_evidence_by_company(company: str, evidence_enriched: Dict[str, List[Dict[str, str]]]) -> Dict[str, List[Dict[str, str]]]:
     out: Dict[str, List[Dict[str, str]]] = {}
     for task, items in evidence_enriched.items():
         scored = []
         for it in items:
-            score, others = _company_fit_score_for_item(company, it.get("title",""), it.get("snippet",""), it.get("body",""))
-            scored.append((score, it, others))
+            s, others, tgt_body_cnt = _company_fit_score_for_item(company, it.get("title",""), it.get("snippet",""), it.get("body",""))
+            scored.append((s, tgt_body_cnt, it, others))
         scored.sort(key=lambda x: x[0], reverse=True)
         kept = []
-        for s, it, others in scored:
-            # 条件：ターゲット最低1回、スコア>=1
-            _, _others = _company_fit_score_for_item(company, it.get("title",""), it.get("snippet",""), it.get("body",""))
-            target_cnt = sum(1 for _ in range(1))  # ダミー
-            # 再計算（上と同じ式だが target_cnt>=1 をチェックしたい）
-            title = it.get("title",""); snippet = it.get("snippet",""); body = it.get("body","")
-            target_cnt_exact = 0
-            for tv in _variants_for_target(company):
-                if not tv: continue
-                target_cnt_exact += len(re.findall(re.escape(tv), _strip_corp_words(title+snippet+body), flags=re.IGNORECASE))
-            if target_cnt_exact >= 1 and s >= 1.0:
+        for s, tgt_cnt, it, others in scored:
+            # 条件：本文/タイトル/スニペットの正規化後にターゲット≥1、かつスコア>=1
+            if tgt_cnt >= 1 and s >= 1.0:
                 kept.append(it)
         out[task] = kept
     return out
@@ -343,12 +323,10 @@ def _safe_json_loads(text: str) -> dict:
 def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[str, str]]]) -> Dict[str, Any]:
     if not _oai:
         return {}
-
     prompt_user = PROMPT_USER_TEMPLATE.format(
         company=company,
         evidence_json=json.dumps(evidence_enriched, ensure_ascii=False)[:120000]
     )
-
     resp = _oai.responses.create(
         model=MODEL_REASON,
         temperature=0.0,
@@ -357,7 +335,6 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
     )
     text = resp.output_text
     data = _safe_json_loads(text)
-
     if not data or "per_task" not in data:
         resp2 = _oai.responses.create(
             model=MODEL_REASON,
@@ -389,17 +366,11 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         return skeleton
 
 # =========================
-# Streamlit UI
+# Streamlit UI（Secretsセクションなし） + 自動ダウンロード
 # =========================
 st.set_page_config(page_title="Corporate–Startup Fit Checker+", layout="wide")
 st.title("🏢➡️🤝🚀 Corporate–Startup Fit Checker+")
-st.caption("C列=会社名。Google CSEで証跡を集め、本文取得→会社名スコアで他社記事を除外→OpenAIで判定。Xドラフト付き。")
-
-with st.expander("🔧 Secrets設定（必須）", expanded=False):
-    st.markdown(
-        "- `.streamlit/secrets.toml` に `GOOGLE_API_KEY`, `GOOGLE_CSE_ID`, `OPENAI_API_KEY` を設定。\n"
-        "```toml\n[general]\nGOOGLE_API_KEY=\"xxxxx\"\nGOOGLE_CSE_ID=\"xxxx:yyyy\"\nOPENAI_API_KEY=\"sk-...\"\n```\n"
-    )
+st.caption("C列=会社名。Google CSEで証跡→本文取得→会社名スコアで他社記事を除外→OpenAIで判定。Xドラフト付き。")
 
 cols = st.columns(3)
 with cols[0]:
@@ -408,6 +379,12 @@ with cols[1]:
     limit = st.number_input("処理件数の上限", 1, 5000, 50, 10)
 with cols[2]:
     max_sources = st.slider("各タスクの最大参照URL数", 1, 8, 5)
+
+# 自動DLの一回制御
+if "auto_dl_done" not in st.session_state:
+    st.session_state.auto_dl_done = False
+if "last_csv_b64" not in st.session_state:
+    st.session_state.last_csv_b64 = ""
 
 run = st.button("解析スタート", type="primary", disabled=uploaded is None)
 
@@ -433,10 +410,7 @@ if run and uploaded:
         try:
             ev = gather_evidence(company)
             ev_enriched = hydrate_evidence_with_content(ev, max_sources_per_task=max_sources)
-
-            # ★ 会社名スコアで他社優勢記事を除外
             ev_enriched = filter_evidence_by_company(company, ev_enriched)
-
             reasoning = ask_openai_reasoning(company, ev_enriched) if OPENAI_API_KEY else {"per_task": {}, "x_post": {"jp":"", "en":""}}
             per_task = reasoning.get("per_task", {})
             x_post = reasoning.get("x_post", {"jp":"", "en":""})
@@ -485,11 +459,40 @@ if run and uploaded:
         time.sleep(0.05)
 
     out = pd.DataFrame(rows)
+    csv = out.to_csv(index=False)
+    b64 = base64.b64encode(csv.encode("utf-8")).decode()
+    st.session_state.last_csv_b64 = b64
+    st.session_state.auto_dl_done = False  # 新規生成のたびに再DL可に
+
     with tabs[1]:
         st.success("完了！")
         st.dataframe(out, use_container_width=True)
-        csv = out.to_csv(index=False)
-        st.download_button("CSVをダウンロード", data=csv, file_name="corporate_fit_with_reasons.csv", mime="text/csv")
+
+        # 手動ダウンロード（保険）
+        st.download_button(
+            "CSVをダウンロード",
+            data=csv,
+            file_name="corporate_fit_with_reasons.csv",
+            mime="text/csv",
+        )
+
+        # 自動ダウンロード（1回だけ）
+        if not st.session_state.auto_dl_done and st.session_state.last_csv_b64:
+            st.session_state.auto_dl_done = True
+            st.components.v1.html(
+                f"""
+                <html><body>
+                <a id="autodl" href="data:text/csv;base64,{st.session_state.last_csv_b64}"
+                   download="corporate_fit_with_reasons.csv"></a>
+                <script>
+                  const a = document.getElementById('autodl');
+                  if (a) a.click();
+                </script>
+                </body></html>
+                """,
+                height=0,
+            )
+            st.info("CSV を自動ダウンロードしました。ブラウザがブロックした場合は上のボタンから保存してください。")
 
     with tabs[2]:
         for block in detail_log:
