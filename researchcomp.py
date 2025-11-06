@@ -5,12 +5,13 @@ import time
 import json
 import html
 import traceback
+import unicodedata
 import requests
 import pandas as pd
 import streamlit as st
 from urllib.parse import urlencode, urlparse
-from typing import List, Dict, Any
-from collections import defaultdict
+from typing import List, Dict, Any, Tuple
+from collections import defaultdict, Counter
 
 # =========================
 # 設定（Secrets を優先）
@@ -30,32 +31,26 @@ MODEL_REASON = os.getenv("OPENAI_REASONING_MODEL", "gpt-4.1-mini")
 # =========================
 # ユーティリティ
 # =========================
-SAFE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.0)"
-}
+SAFE_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; CorporateStartupFit/1.1)"}
 REQUEST_TIMEOUT = 20
 
 def _strip_html(raw: str) -> str:
-    """超軽量の HTML → プレーンテキスト化"""
     if not raw:
         return ""
     raw = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
     text = re.sub(r"(?s)<[^>]+>", " ", raw)
     text = html.unescape(text)
+    text = unicodedata.normalize("NFKC", text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     text = re.sub(r"\n+", "\n", text)
     return text.strip()
 
 def _domain_score(url: str) -> int:
-    """公式/IR/PR を優先する簡易スコア"""
     host = urlparse(url).netloc.lower()
     score = 0
-    if host.endswith(".co.jp") or host.endswith(".com"):
-        score += 1
-    if any(k in host for k in ["ir.", "prtimes.jp", "news.", "press"]):
-        score += 2
-    if any(p in url.lower() for p in ["/ir", "/investor", "/press", "/news", "/release"]):
-        score += 2
+    if host.endswith(".co.jp") or host.endswith(".com"): score += 1
+    if any(k in host for k in ["ir.", "prtimes.jp", "prtimes.co.jp", "news.", "press"]): score += 2
+    if any(p in url.lower() for p in ["/ir", "/investor", "/press", "/news", "/release"]): score += 2
     return score
 
 def _dedup_urls(items: List[Dict[str, str]], max_per_domain: int = 3) -> List[Dict[str, str]]:
@@ -64,14 +59,10 @@ def _dedup_urls(items: List[Dict[str, str]], max_per_domain: int = 3) -> List[Di
     out = []
     for it in items:
         u = it.get("link", "")
-        if not u or u in seen:
-            continue
+        if not u or u in seen: continue
         d = urlparse(u).netloc
-        if domain_counter[d] >= max_per_domain:
-            continue
-        seen.add(u)
-        domain_counter[d] += 1
-        out.append(it)
+        if domain_counter[d] >= max_per_domain: continue
+        seen.add(u); domain_counter[d] += 1; out.append(it)
     return out
 
 # =========================
@@ -94,18 +85,12 @@ def google_search(q: str, num: int = 6) -> List[Dict[str, str]]:
     r = requests.get(url, timeout=REQUEST_TIMEOUT)
     r.raise_for_status()
     j = r.json()
-    items = []
-    for it in j.get("items", []):
-        items.append({
-            "title": it.get("title",""),
-            "link": it.get("link",""),
-            "snippet": it.get("snippet",""),
-        })
+    items = [{"title": it.get("title",""), "link": it.get("link",""), "snippet": it.get("snippet","")} for it in j.get("items", [])]
     items.sort(key=lambda x: _domain_score(x["link"]), reverse=True)
     return _dedup_urls(items, max_per_domain=2)
 
 @st.cache_data(show_spinner=False, ttl=60*60)
-def fetch_text(url: str, max_chars: int = 4000) -> str:
+def fetch_text(url: str, max_chars: int = 5000) -> str:
     try:
         r = requests.get(url, headers=SAFE_HEADERS, timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
@@ -127,27 +112,28 @@ TASKS = {
 }
 
 def _queries_for(company: str) -> Dict[str, List[str]]:
-    """日英 + シノニムを含むクエリ束を作成"""
+    # 会社名を引用符で固定し、混入を下げる（除外リストは使わない）
+    quoted = f"\"{company.strip()}\""
     return {
         "CVC": [
-            f"{company} CVC コーポレートベンチャーキャピタル 立ち上げ 投資子会社",
-            f"{company} corporate venture capital CVC fund launch investing arm",
+            f"{quoted} CVC コーポレートベンチャーキャピタル 立ち上げ 投資子会社",
+            f"{quoted} corporate venture capital CVC fund launch investing arm",
         ],
         "LP": [
-            f"{company} LP 出資 リミテッドパートナー ベンチャーファンド 出資参画",
-            f"{company} limited partner LP commitment venture fund investor",
+            f"{quoted} LP 出資 リミテッドパートナー ベンチャーファンド 出資参画",
+            f"{quoted} limited partner LP commitment venture fund investor",
         ],
         "AI_Robotics": [
-            f"{company} AI ロボティクス 提携 出資 共同開発 スタートアップ",
-            f"{company} AI robotics partnership investment startup collaboration",
+            f"{quoted} AI ロボティクス 提携 出資 共同開発 スタートアップ",
+            f"{quoted} AI robotics partnership investment startup collaboration",
         ],
         "Healthcare": [
-            f"{company} ヘルスケア 医療 デジタルヘルス 提携 出資 共同研究",
-            f"{company} healthcare medtech digital health partnership investment",
+            f"{quoted} ヘルスケア 医療 デジタルヘルス 提携 出資 共同研究",
+            f"{quoted} healthcare medtech digital health partnership investment",
         ],
         "Climate": [
-            f"{company} 脱炭素 クライメートテック 再生可能エネルギー 水素 CCS 提携 出資",
-            f"{company} climate tech decarbonization renewable hydrogen CCS partnership investment",
+            f"{quoted} 脱炭素 クライメートテック 再生可能エネルギー 水素 CCS 提携 出資",
+            f"{quoted} climate tech decarbonization renewable hydrogen CCS partnership investment",
         ],
     }
 
@@ -158,36 +144,141 @@ def gather_evidence(company: str, per_query_limit: int = 6, per_task_urls: int =
     for k, qlist in queries.items():
         bucket = []
         for q in qlist:
-            time.sleep(0.25)  # レート緩和
+            time.sleep(0.25)
             bucket.extend(google_search(q, num=per_query_limit))
-        # 同一 URL をまとめ、上位優先
-        seen = set()
-        uniq = []
+        seen = set(); uniq = []
         for it in bucket:
             u = it["link"]
-            if u in seen:
-                continue
-            seen.add(u)
-            uniq.append(it)
+            if u in seen: continue
+            seen.add(u); uniq.append(it)
         ev_raw[k] = uniq[:per_task_urls]
     return ev_raw
 
 @st.cache_data(show_spinner=False, ttl=60*60)
 def hydrate_evidence_with_content(evidence: Dict[str, List[Dict[str, str]]], max_sources_per_task: int = 5) -> Dict[str, List[Dict[str, str]]]:
-    """各 URL から本文（先頭数千文字）を取得して evidence に埋め込む"""
     out: Dict[str, List[Dict[str, str]]] = {}
     for task, items in evidence.items():
         enriched = []
         for it in items[:max_sources_per_task]:
             url = it["link"]
             body = fetch_text(url, max_chars=5000)
-            enriched.append({
-                "title": it.get("title",""),
-                "link": url,
-                "snippet": it.get("snippet",""),
-                "body": body,
-            })
+            enriched.append({"title": it.get("title",""), "link": url, "snippet": it.get("snippet",""), "body": body})
         out[task] = enriched
+    return out
+
+# =========================
+# 会社名フィット・スコアリング（リスト不要）
+# =========================
+JP_CORP_SUFFIXES = ["株式会社", "（株）", "(株)", "ホールディングス", "ホールディングス株式会社", "グループ", "グループ株式会社"]
+EN_CORP_SUFFIXES = ["Co., Ltd.", "Co.,Ltd.", "Company, Limited", "Inc.", "Incorporated", "Corporation", "Corp.", "Holdings", "Group", "Limited", "Ltd."]
+
+def _normalize_name(n: str) -> str:
+    s = unicodedata.normalize("NFKC", n or "")
+    s = s.strip()
+    # 前置/後置の株式会社などを除去した版も作るため、ここでは軽めに統一（両方で比較）
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _strip_corp_words(n: str) -> str:
+    s = n
+    for w in JP_CORP_SUFFIXES:
+        s = s.replace(w, "")
+    for w in EN_CORP_SUFFIXES:
+        s = s.replace(w, "")
+    s = s.replace("Kabushiki Kaisha", "")
+    s = s.replace("K.K.", "")
+    s = re.sub(r"[.,・／/|｜\-‐-–—~〜()\[\]{}＜＞<>]", " ", s)
+    s = re.sub(r"\s+", "", s).lower()
+    return s
+
+def _variants_for_target(company: str) -> List[str]:
+    base = _normalize_name(company)
+    v = {base}
+    # 「株式会社◯◯」「◯◯株式会社」を両取り
+    if base.startswith("株式会社"):
+        v.add(base.replace("株式会社", "", 1).strip())
+    if base.endswith("株式会社"):
+        v.add(base.replace("株式会社", "").strip())
+    # スペース・記号除去の正規化
+    v2 = set()
+    for x in v:
+        v2.add(_strip_corp_words(x))
+    return list(v2)
+
+# 企業名らしき表現を本文から抽出（JP/ENの素朴な正規表現）
+COMPANY_PATTERNS = [
+    r"株式会社\s*([^\s、。：「」『』()（）【】\n]{1,30})",
+    r"([^\s、。：「」『』()（）【】\n]{1,30})\s*株式会社",
+    r"（株）\s*([^\s、。：「」『』()（）【】\n]{1,30})",
+    r"([A-Z][A-Za-z0-9&.\- ]{1,60})\s+(?:Co\.?,?\s*Ltd\.?|Inc\.|Corporation|Corp\.|Holdings|Group|Limited|Ltd\.)",
+]
+
+def _extract_company_like_names(text: str) -> List[str]:
+    if not text: return []
+    names = []
+    for pat in COMPANY_PATTERNS:
+        for m in re.findall(pat, text):
+            if isinstance(m, tuple):
+                m = m[0]
+            nm = _normalize_name(m)
+            if 1 <= len(nm) <= 60:
+                names.append(nm)
+    return names
+
+def _company_fit_score_for_item(company: str, title: str, snippet: str, body: str) -> Tuple[float, Counter]:
+    target_vars = _variants_for_target(company)  # 例：{"共同印刷", "共同印刷"} → 正規化済み
+    title_n = unicodedata.normalize("NFKC", title or "")
+    snip_n  = unicodedata.normalize("NFKC", snippet or "")
+    body_n  = unicodedata.normalize("NFKC", body or "")
+
+    # 出現カウント（ターゲット）
+    def count_target(s: str) -> int:
+        c = 0
+        for tv in target_vars:
+            # 簡易：企業接尾辞を外したキーで連続一致数を数える
+            if not tv: continue
+            c += len(re.findall(re.escape(tv), _strip_corp_words(s), flags=re.IGNORECASE))
+        return c
+
+    title_hit = count_target(title_n) > 0
+    snip_hit  = count_target(snip_n)  > 0
+    body_cnt  = count_target(body_n)
+
+    # 他社候補の抽出とカウント
+    names = _extract_company_like_names(body_n + " " + title_n)
+    other_counter = Counter()
+    for n in names:
+        norm = _strip_corp_words(n)
+        if norm and norm not in target_vars:
+            other_counter[norm] += 1
+    max_other = max(other_counter.values()) if other_counter else 0
+
+    # スコア
+    score = (2 if title_hit else 0) + (1 if snip_hit else 0) + body_cnt - 2 * max_other
+    return score, other_counter
+
+def filter_evidence_by_company(company: str, evidence_enriched: Dict[str, List[Dict[str, str]]]) -> Dict[str, List[Dict[str, str]]]:
+    out: Dict[str, List[Dict[str, str]]] = {}
+    for task, items in evidence_enriched.items():
+        scored = []
+        for it in items:
+            score, others = _company_fit_score_for_item(company, it.get("title",""), it.get("snippet",""), it.get("body",""))
+            scored.append((score, it, others))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        kept = []
+        for s, it, others in scored:
+            # 条件：ターゲット最低1回、スコア>=1
+            _, _others = _company_fit_score_for_item(company, it.get("title",""), it.get("snippet",""), it.get("body",""))
+            target_cnt = sum(1 for _ in range(1))  # ダミー
+            # 再計算（上と同じ式だが target_cnt>=1 をチェックしたい）
+            title = it.get("title",""); snippet = it.get("snippet",""); body = it.get("body","")
+            target_cnt_exact = 0
+            for tv in _variants_for_target(company):
+                if not tv: continue
+                target_cnt_exact += len(re.findall(re.escape(tv), _strip_corp_words(title+snippet+body), flags=re.IGNORECASE))
+            if target_cnt_exact >= 1 and s >= 1.0:
+                kept.append(it)
+        out[task] = kept
     return out
 
 # =========================
@@ -203,17 +294,21 @@ PROMPT_USER_TEMPLATE = """
 You will judge one company across tasks with provided web evidence (titles, snippets, and fetched page body).
 Company: {company}
 
+Decision hygiene (company-specific):
+- Ignore any evidence where the target company name does NOT appear in the title or body at least once.
+- If multiple specific company names appear, treat the article as valid ONLY if the target's mentions are not fewer than the most frequently mentioned other company name in that article. Otherwise, mark as 'Unclear'.
+
 Definitions and decision rules (apply strictly):
 - CVC: The company has its own corporate venture capital arm or investment subsidiary (e.g., 'CVC', 'corporate venture capital', 'investment subsidiary', 'capital partners'). One-off venture investments without a dedicated arm → do NOT mark 'Yes'.
 - LP: The company has committed capital as a limited partner to an external venture fund (e.g., 'LP', 'limited partner', 'commitment', '出資', 'リミテッドパートナー'). If only investing directly as a CVC without LP commitment, mark 'No' (unless LP is also evidenced).
-- Synergy (AI_Robotics / Healthcare / Climate): Mark 'Yes' only if there is concrete evidence of products, partnerships, investments, pilots, or stated strategic focus that clearly connects to the domain. Generic news without relation to the company's business → 'Unclear'.
+- Synergy (AI_Robotics / Healthcare / Climate): Mark 'Yes' only if there is concrete evidence of products, partnerships, investments, pilots, or stated strategic focus that clearly connects to the domain. Generic news unrelated to the company's business → 'Unclear'.
 
 Hard constraints:
 - Output must be valid JSON (UTF-8, no trailing commas, no comments).
 - For each task, set 'label' ∈ {{'Yes','No','Unclear'}}, 'confidence' ∈ [0,1].
 - 'reason_ja': ≤100 Japanese characters. 'reason_en': 1–2 sentences English.
 - 'evidence_urls': include up to 3 URLs, but ONLY from the provided evidence links. Do NOT invent URLs.
-- If signals are mixed or decade-old without follow-ups, prefer 'Unclear'.
+- If signals conflict or are outdated without follow-ups, prefer 'Unclear'.
 - If CVC is 'Yes' and LP also 'Yes', ensure reasons clearly distinguish between the two.
 - If no relevant evidence, use 'Unclear' with confidence 0.2.
 
@@ -254,7 +349,6 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
         evidence_json=json.dumps(evidence_enriched, ensure_ascii=False)[:120000]
     )
 
-    # 1回目
     resp = _oai.responses.create(
         model=MODEL_REASON,
         temperature=0.0,
@@ -264,22 +358,17 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
     text = resp.output_text
     data = _safe_json_loads(text)
 
-    # パース失敗 or 欠損が大きい場合は 1 回だけ再試行
     if not data or "per_task" not in data:
         resp2 = _oai.responses.create(
             model=MODEL_REASON,
             temperature=0.0,
             max_output_tokens=1500,
-            input=(
-                "System:\n" + PROMPT_SYSTEM +
-                "\n\nUser:\nReturn ONLY valid JSON per the schema. If previous attempt failed, correct and resend the JSON.\n" +
-                prompt_user
-            ),
+            input=("System:\n" + PROMPT_SYSTEM + "\n\nUser:\nReturn ONLY valid JSON per the schema. "
+                   "If previous attempt failed, correct and resend the JSON.\n" + prompt_user),
         )
         text = resp2.output_text
         data = _safe_json_loads(text)
 
-    # スキーマの穴埋め（最終防御）
     skeleton = {
         "per_task": {k: {"label":"Unclear","confidence":0.2,"reason_ja":"","reason_en":"","evidence_urls":[]} for k in TASKS},
         "x_post": {"jp":"","en":""}
@@ -304,7 +393,7 @@ def ask_openai_reasoning(company: str, evidence_enriched: Dict[str, List[Dict[st
 # =========================
 st.set_page_config(page_title="Corporate–Startup Fit Checker+", layout="wide")
 st.title("🏢➡️🤝🚀 Corporate–Startup Fit Checker+")
-st.caption("C列=会社名。Google CSEで証跡を集め、本文取得→OpenAIで CVC/LP/シナジーを厳密判定。Xドラフト付き。")
+st.caption("C列=会社名。Google CSEで証跡を集め、本文取得→会社名スコアで他社記事を除外→OpenAIで判定。Xドラフト付き。")
 
 with st.expander("🔧 Secrets設定（必須）", expanded=False):
     st.markdown(
@@ -324,7 +413,6 @@ run = st.button("解析スタート", type="primary", disabled=uploaded is None)
 
 if run and uploaded:
     df = pd.read_excel(uploaded)
-    # 会社列の推定（C列優先→最終列）
     if df.shape[1] >= 3:
         companies = df.iloc[:, 2].dropna().astype(str).tolist()
     else:
@@ -334,10 +422,9 @@ if run and uploaded:
     rows = []
     progress = st.progress(0.0)
     status = st.empty()
-
     tabs = st.tabs(["進捗", "最終テーブル", "詳細ログ"])
     with tabs[0]:
-        st.write("検索→本文取得→判定を順に実行します。")
+        st.write("検索→本文取得→会社名フィルタ→判定の順で実行します。")
 
     detail_log = []
 
@@ -346,6 +433,9 @@ if run and uploaded:
         try:
             ev = gather_evidence(company)
             ev_enriched = hydrate_evidence_with_content(ev, max_sources_per_task=max_sources)
+
+            # ★ 会社名スコアで他社優勢記事を除外
+            ev_enriched = filter_evidence_by_company(company, ev_enriched)
 
             reasoning = ask_openai_reasoning(company, ev_enriched) if OPENAI_API_KEY else {"per_task": {}, "x_post": {"jp":"", "en":""}}
             per_task = reasoning.get("per_task", {})
@@ -356,19 +446,16 @@ if run and uploaded:
 
             row = {
                 "company": company,
-                # ラベル
                 "CVC":        cell("CVC", "label", "Unclear"),
                 "LP":         cell("LP", "label", "Unclear"),
                 "AI_Robotics":cell("AI_Robotics", "label", "Unclear"),
                 "Healthcare": cell("Healthcare", "label", "Unclear"),
                 "Climate":    cell("Climate", "label", "Unclear"),
-                # 信頼度
                 "CVC_conf":        cell("CVC", "confidence", ""),
                 "LP_conf":         cell("LP", "confidence", ""),
                 "AI_Robotics_conf":cell("AI_Robotics", "confidence", ""),
                 "Healthcare_conf": cell("Healthcare", "confidence", ""),
                 "Climate_conf":    cell("Climate", "confidence", ""),
-                # 理由（日/英）
                 "CVC_reason_ja":        cell("CVC", "reason_ja", ""),
                 "LP_reason_ja":         cell("LP", "reason_ja", ""),
                 "AI_Robotics_reason_ja":cell("AI_Robotics", "reason_ja", ""),
@@ -379,23 +466,17 @@ if run and uploaded:
                 "AI_Robotics_reason_en":cell("AI_Robotics", "reason_en", ""),
                 "Healthcare_reason_en": cell("Healthcare", "reason_en", ""),
                 "Climate_reason_en":    cell("Climate", "reason_en", ""),
-                # URL（最大3件を;区切りで）
                 "CVC_urls":        "; ".join(per_task.get("CVC", {}).get("evidence_urls", [])),
                 "LP_urls":         "; ".join(per_task.get("LP", {}).get("evidence_urls", [])),
                 "AI_Robotics_urls":"; ".join(per_task.get("AI_Robotics", {}).get("evidence_urls", [])),
                 "Healthcare_urls": "; ".join(per_task.get("Healthcare", {}).get("evidence_urls", [])),
                 "Climate_urls":    "; ".join(per_task.get("Climate", {}).get("evidence_urls", [])),
-                # X投稿ドラフト
                 "x_post_jp": x_post.get("jp", ""),
                 "x_post_en": x_post.get("en", "")
             }
             rows.append(row)
 
-            detail_log.append({
-                "company": company,
-                "evidence": ev_enriched,
-                "result": reasoning
-            })
+            detail_log.append({"company": company, "evidence": ev_enriched, "result": reasoning})
         except Exception as e:
             rows.append({"company": company, "error": str(e)})
             detail_log.append({"company": company, "error": str(e), "trace": traceback.format_exc()})
@@ -404,7 +485,6 @@ if run and uploaded:
         time.sleep(0.05)
 
     out = pd.DataFrame(rows)
-
     with tabs[1]:
         st.success("完了！")
         st.dataframe(out, use_container_width=True)
@@ -418,7 +498,7 @@ if run and uploaded:
                     st.error(block["error"])
                     st.code(block.get("trace",""))
                 else:
-                    st.markdown("**参照 Evidence（各タスク 上位）**")
+                    st.markdown("**参照 Evidence（各タスク）**")
                     for task, items in block["evidence"].items():
                         st.markdown(f"- **{task}**")
                         for it in items:
