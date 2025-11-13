@@ -139,6 +139,12 @@ class INote(BaseModel):
         description="日本語の箇条書き",
         validation_alias=AliasChoices("transcript_bullets_ja", "transcript_bullets", "bullets"),
     )
+    # ▼ 追加：英語タグ（自動生成）
+    tags_en: List[str] = Field(
+        default_factory=list,
+        description="英語キーワードタグ（3〜8語）",
+        validation_alias=AliasChoices("tags_en", "tags", "keywords"),
+    )
     model_config = ConfigDict(extra="ignore")
 
 class INoteResp(BaseModel):
@@ -214,7 +220,8 @@ with tab1:
             prompt = f"""
 あなたは会議メモの整形アシスタントです。以下の「生メモ」から、
 (1) 会議題名（日本語）、(2) 日付（YYYY-MM-DD、文脈から推定。なければ {today_iso} を使用）、
-(3) 日本語の要約（200文字以内）、(4) 日本語の箇条書きTranscript（詳しめ、5〜12項目）を生成し、
+(3) 日本語の要約（200文字以内）、(4) 日本語の箇条書きTranscript（詳しめ、5〜12項目）、
+(5) 英語キーワードタグ（3〜8語；起業・VC・政策・計量・国際投資に関連する語）を生成し、
 次のJSON構造のみを返してください（マークダウンやコメント不要）。
 
 構造:
@@ -223,7 +230,8 @@ with tab1:
     "name_ja": "...",
     "date_iso": "YYYY-MM-DD",
     "summary_ja": "... (<=200字)",
-    "transcript_bullets_ja": ["...", "..."]
+    "transcript_bullets_ja": ["...", "..."],
+    "tags_en": ["entrepreneurship", "venture capital", "..."]
   }}
 }}
 
@@ -241,6 +249,8 @@ with tab1:
                 st.session_state["inote_date"] = note.date_iso
                 st.session_state["inote_summary"] = note.summary_ja
                 st.session_state["inote_transcript"] = "・" + "\n・".join(note.transcript_bullets_ja)
+                # ▼ 追加：英語タグをカンマ区切りでUIに流し込む
+                st.session_state["inote_tags_en"] = ", ".join([t.strip() for t in note.tags_en if str(t).strip()])
                 st.success("生成しました。下で編集できます。")
             except ValidationError as ve:
                 st.error("JSONの構造検証に失敗しました。")
@@ -261,7 +271,7 @@ with tab1:
     name_ja = st.text_input("Name（会議の題名・日本語）", value=st.session_state.get("inote_name", ""))
     date_iso = st.text_input("Date（YYYY-MM-DD）", value=st.session_state.get("inote_date", date.today().isoformat()))
     summary_ja = st.text_area("Summary（200字目安・日本語）", value=st.session_state.get("inote_summary", ""), height=100)
-    tags_en = st.text_input("Tags（英語・カンマ区切り。任意）", value="")
+    tags_en = st.text_input("Tags（英語・カンマ区切り。任意）", value=st.session_state.get("inote_tags_en", ""))
     transcript_ja = st.text_area(
         "Transcript（日本語：詳しめの箇条書き）",
         value=st.session_state.get("inote_transcript", ""),
