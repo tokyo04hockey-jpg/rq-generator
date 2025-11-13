@@ -1,16 +1,16 @@
 # streamlit_app.py
 # ------------------------------------------------------------
-# Minimal RQ Builder: Meeting notes -> RQ generation -> edit -> Notion save
+# RQ Builder: Meeting notes -> RQ generation -> edit -> Notion save
 #
 # Requirements (examples)
 #   streamlit==1.39.0
-#   openai>=1.50.0
+#   openai>=1.30.0  # 1.51+ だと responses API が安定。古くてもフォールバックで動作
 #   notion-client>=2.2.1
 #   pydantic>=2.8.0
 #
-# Secrets (.streamlit/secrets.toml)
+# .streamlit/secrets.toml
 #   OPENAI_API_KEY = "sk-..."
-#   NOTION_TOKEN = "secret_..."
+#   NOTION_TOKEN = "ntn_..."  # または secret_...
 #   NOTION_DATABASE_ID = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 # ------------------------------------------------------------
 
@@ -86,21 +86,80 @@ class RQResponse(BaseModel):
     source_summary: Optional[str] = None
     items: List[RQItem]
 
-def extract_output_text(resp) -> str:
+# ---------- OpenAI call with fallbacks ----------
+def call_openai_structured(oa_client: OpenAI, prompt: str, schema: dict, preferred_model: str):
     """
-    OpenAI Python SDK のバージョン差異を吸収してテキストを取り出す。
+    順に試すフォールバック:
+      1) responses.create + json_schema
+      2) chat.completions.create + json_schema
+      3) chat.completions.create + json_object
+      4) chat.completions.create (plain) -> json.loads
+    返り値: Python dict
     """
-    # Newer SDKs
-    if hasattr(resp, "output_text") and resp.output_text:
-        return resp.output_text
-    # Fallback: responses.create の生構造を辿る
+    # 1) Responses API + json_schema
     try:
-        return resp.output[0].content[0].text
+        resp = oa_client.responses.create(
+            model=preferred_model,
+            input=prompt,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "rq_payload", "schema": schema, "strict": True},
+            },
+        )
+        if hasattr(resp, "output_text") and resp.output_text:
+            return json.loads(resp.output_text)
+        return json.loads(resp.output[0].content[0].text)
+    except TypeError:
+        # SDKが response_format 未対応（今回の主因）
+        pass
     except Exception:
-        # 最後の手段：文字列化
-        return json.dumps(resp, ensure_ascii=False)
+        pass
 
-# ---------- Generate ----------
+    # 2) Chat Completions + json_schema
+    try:
+        resp = oa_client.chat.completions.create(
+            model=preferred_model,
+            messages=[
+                {"role": "system", "content": "You are a strict JSON generator. Return only JSON that matches the schema."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "rq_payload", "schema": schema, "strict": True},
+            },
+            temperature=0.2,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        pass
+
+    # 3) Chat Completions + json_object（キー整合のみ担保）
+    try:
+        resp = oa_client.chat.completions.create(
+            model=preferred_model,
+            messages=[
+                {"role": "system", "content": "Return only valid JSON (no extra text)."},
+                {"role": "user", "content": prompt},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0.2,
+        )
+        return json.loads(resp.choices[0].message.content)
+    except Exception:
+        pass
+
+    # 4) 最終フォールバック：プレーン→json.loads（失敗時は例外を上げる）
+    resp = oa_client.chat.completions.create(
+        model=preferred_model,
+        messages=[
+            {"role": "system", "content": "Return JSON only. No commentary."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+    )
+    return json.loads(resp.choices[0].message.content)
+
+# ---------- Generate UI ----------
 col_g1, col_g2 = st.columns([1, 3])
 with col_g1:
     gen_btn = st.button("🔮 RQを生成", disabled=not bool(notes))
@@ -109,7 +168,7 @@ with col_g2:
 
 if reset_btn:
     for k in list(st.session_state.keys()):
-        if k.startswith("rq_"):
+        if k.startswith("rq_") or k in ("rq_items", "rq_editor"):
             del st.session_state[k]
     st.rerun()
 
@@ -121,7 +180,7 @@ if gen_btn:
 各候補について以下の項目を必ず埋めて、JSONで返します：
 
 - title_ja：研究クエスチョン（日本語、1行）
-- proposed_approach_ja：方法論案（日本語、2〜4文。使用するデータ例・分析枠組み（例：DiD/IV/回帰不連続/質的比較等）・識別戦略の方向性をできる範囲で明示）
+- proposed_approach_ja：方法論案（日本語、2〜4文。使用するデータ例・分析枠組み（例：DiD/IV/RD/質的比較等）・識別戦略の方向性をできる範囲で明示）
 - keywords_en：分類・検索用のキーワード（英語、3〜7語）
 
 最低3件、最大{max_items}件程度を返してください。
@@ -129,22 +188,13 @@ if gen_btn:
 [議事録]
 {notes}
 """.strip()
-
         try:
-            resp = oa_client.responses.create(
-                model=model,
-                input=prompt,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "rq_payload", "schema": schema, "strict": True},
-                },
-            )
-            raw_text = extract_output_text(resp)
-            data = RQResponse.model_validate_json(raw_text)
+            raw_obj = call_openai_structured(oa_client, prompt, schema, model)
+            data = RQResponse.model_validate(raw_obj)  # 厳密検証
             st.session_state["rq_items"] = [it.model_dump() for it in data.items]
             st.success("RQ候補を生成しました。下で編集できます。")
         except ValidationError as ve:
-            st.error("JSONの構造検証に失敗しました。プロンプトを見直すか、もう一度お試しください。")
+            st.error("JSONの構造検証に失敗しました。もう一度お試しください。")
             st.exception(ve)
         except Exception as e:
             st.error("生成中にエラーが発生しました。")
@@ -197,7 +247,7 @@ if "rq_items" in st.session_state and st.session_state["rq_items"]:
                     notion.pages.create(
                         parent={"database_id": NOTION_DATABASE_ID},
                         properties={
-                            # ---- ご指定スキーマに準拠 ----
+                            # ---- ご指定のNotionスキーマ ----
                             "Name": {"title": [{"text": {"content": (row["Name"] or "")[:200]}}]},
                             "Gap Identified": {"rich_text": [{"text": {"content": "TBD"}}]},
                             "Priority": {"select": {"name": "Medium"}},
