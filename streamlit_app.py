@@ -335,9 +335,8 @@ with tab1:
     st.subheader("🗂️ 保存済みノート（Notionから取得 → RQタブに転送）")
 
     try:
-        db = notion.databases.query(database_id=NOTION_INTERVIEW_DB_ID)
+        db = query_database_safe(notion, NOTION_INTERVIEW_DB_ID)
         for p in db.get("results", []):
-            # 安全に取り出し
             props = p.get("properties", {})
             title = ""
             try:
@@ -354,7 +353,7 @@ with tab1:
                 transcript_txt = "".join([t["plain_text"] for t in props["Transcript"]["rich_text"]])
             except Exception:
                 pass
-
+        
             with st.expander(f"📝 {title}"):
                 st.write(summary_txt or "_（No Summary）_")
                 colb1, colb2 = st.columns(2)
