@@ -4,7 +4,7 @@
 #
 # Requirements (examples)
 #   streamlit==1.39.0
-#   openai>=1.30.0  # 1.51+ だと responses API が安定。古くてもフォールバックで動作
+#   openai>=1.30.0   # 1.51+ 推奨（responses API安定）。古くてもフォールバックで動作
 #   notion-client>=2.2.1
 #   pydantic>=2.8.0
 #
@@ -21,7 +21,8 @@ import pandas as pd
 import streamlit as st
 from notion_client import Client as NotionClient
 from openai import OpenAI
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, AliasChoices
+from pydantic import ConfigDict
 
 # ---------- Page setup ----------
 st.set_page_config(page_title="RQ Builder (Notes → Notion)", page_icon="🧪", layout="wide")
@@ -54,6 +55,7 @@ with st.sidebar:
         help="精度↔コストのバランスで選択してください。"
     )
     max_items = st.slider("生成件数（目安）", 3, 8, 6, help="実際の件数はモデル出力次第で前後します。")
+    show_debug = st.checkbox("デバッグ表示（受信JSONを表示）", value=False)
     st.markdown("---")
     st.markdown("**Notion DB**")
     st.code(NOTION_DATABASE_ID, language="text")
@@ -76,20 +78,48 @@ with col2:
 
 st.divider()
 
-# ---------- Structured output schema ----------
+# ---------- Structured output schema (with alias support) ----------
 class RQItem(BaseModel):
-    title_ja: str = Field(..., description="研究リサーチクエスチョン（日本語、1行）")
-    proposed_approach_ja: str = Field(..., description="方法論案（日本語、2〜4文）")
-    keywords_en: List[str] = Field(default_factory=list, description="英語キーワード（3〜7語）")
+    # 生成物の揺れを吸収（title/name/rq/question_ja なども許容）
+    title_ja: str = Field(
+        ...,
+        description="研究リサーチクエスチョン（日本語、1行）",
+        validation_alias=AliasChoices("title_ja", "title", "name", "rq", "question_ja"),
+    )
+    proposed_approach_ja: str = Field(
+        ...,
+        description="方法論案（日本語、2〜4文）",
+        validation_alias=AliasChoices("proposed_approach_ja", "proposed_approach", "approach", "method", "method_ja"),
+    )
+    keywords_en: List[str] = Field(
+        default_factory=list,
+        description="英語キーワード（3〜7語）",
+        validation_alias=AliasChoices("keywords_en", "keywords", "tags"),
+    )
+    model_config = ConfigDict(extra="ignore")  # 余分なフィールドは無視
 
 class RQResponse(BaseModel):
     source_summary: Optional[str] = None
-    items: List[RQItem]
+    # items / research_questions / rqs のどれでもOK
+    items: List[RQItem] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("items", "research_questions", "rqs"),
+    )
+    model_config = ConfigDict(extra="ignore")
 
-# ---------- OpenAI call with fallbacks ----------
+# ---------- Helpers ----------
+def normalize_keywords_en(v) -> List[str]:
+    """モデルが文字列やNoneで返すケースに備えて正規化"""
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return [str(x).strip() for x in v if str(x).strip()]
+    # 文字列の場合はカンマ区切りで分割
+    return [t.strip() for t in str(v).split(",") if t.strip()]
+
 def call_openai_structured(oa_client: OpenAI, prompt: str, schema: dict, preferred_model: str):
     """
-    順に試すフォールバック:
+    フォールバック順:
       1) responses.create + json_schema
       2) chat.completions.create + json_schema
       3) chat.completions.create + json_object
@@ -110,7 +140,7 @@ def call_openai_structured(oa_client: OpenAI, prompt: str, schema: dict, preferr
             return json.loads(resp.output_text)
         return json.loads(resp.output[0].content[0].text)
     except TypeError:
-        # SDKが response_format 未対応（今回の主因）
+        # SDKが response_format 未対応
         pass
     except Exception:
         pass
@@ -177,27 +207,52 @@ if gen_btn:
         schema = RQResponse.model_json_schema()
         prompt = f"""
 あなたは政策×VC研究のアシスタントです。以下の議事録から、研究リサーチクエスチョン候補を日本語で作成してください。
-各候補について以下の項目を必ず埋めて、JSONで返します：
+各候補について以下の項目を必ず埋めて、JSONで返します（トップレベルキーは items 固定）：
 
 - title_ja：研究クエスチョン（日本語、1行）
 - proposed_approach_ja：方法論案（日本語、2〜4文。使用するデータ例・分析枠組み（例：DiD/IV/RD/質的比較等）・識別戦略の方向性をできる範囲で明示）
 - keywords_en：分類・検索用のキーワード（英語、3〜7語）
 
 最低3件、最大{max_items}件程度を返してください。
+必ず有効なJSONのみを返してください。余計な前置きやマークダウンは不要です。
 
 [議事録]
 {notes}
 """.strip()
         try:
             raw_obj = call_openai_structured(oa_client, prompt, schema, model)
-            data = RQResponse.model_validate(raw_obj)  # 厳密検証
-            st.session_state["rq_items"] = [it.model_dump() for it in data.items]
+
+            # デバッグ用に受信JSONを表示（任意）
+            if show_debug:
+                st.subheader("🔎 受信JSON（デバッグ）")
+                st.json(raw_obj)
+
+            data = RQResponse.model_validate(raw_obj)  # 厳密検証（エイリアス対応）
+            # さらに keywords_en を正規化しておく（念のため）
+            items_norm = []
+            for it in data.items:
+                d = it.model_dump()
+                d["keywords_en"] = normalize_keywords_en(d.get("keywords_en"))
+                items_norm.append(d)
+
+            st.session_state["rq_items"] = items_norm
             st.success("RQ候補を生成しました。下で編集できます。")
         except ValidationError as ve:
             st.error("JSONの構造検証に失敗しました。もう一度お試しください。")
+            if show_debug:
+                st.subheader("🔎 受信JSON（デバッグ）")
+                try:
+                    st.json(raw_obj)
+                except Exception:
+                    st.write(raw_obj)
             st.exception(ve)
         except Exception as e:
             st.error("生成中にエラーが発生しました。")
+            if show_debug:
+                try:
+                    st.json(raw_obj)
+                except Exception:
+                    pass
             st.exception(e)
 
 # ---------- Edit table ----------
