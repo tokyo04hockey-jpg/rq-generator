@@ -308,7 +308,7 @@ if "rq_items" in st.session_state and st.session_state["rq_items"]:
                             "Priority": {"select": {"name": "Medium"}},
                             "Proposed Approach": {"rich_text": [{"text": {"content": row["Proposed Approach"] or ""}}]},
                             "Rationale / Background": {"rich_text": [{"text": {"content": "TBD"}}]},
-                            "Status": {"select": {"name": "New"}},
+                            "Status": {"status": {"name": "New"}},
                             "Tags": {"multi_select": to_multi_select_en(row["Tags"])},
                         },
                     )
