@@ -1,222 +1,221 @@
-# streamlit_app.py — RQ生成（関心領域視点込み）＋CSV出力＋論文リンク
-import streamlit as st
-import requests
+# streamlit_app.py
+# ------------------------------------------------------------
+# Minimal RQ Builder: Meeting notes -> RQ generation -> edit -> Notion save
+#
+# Requirements (examples)
+#   streamlit==1.39.0
+#   openai>=1.50.0
+#   notion-client>=2.2.1
+#   pydantic>=2.8.0
+#
+# Secrets (.streamlit/secrets.toml)
+#   OPENAI_API_KEY = "sk-..."
+#   NOTION_TOKEN = "secret_..."
+#   NOTION_DATABASE_ID = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+# ------------------------------------------------------------
+
+import json
+from typing import List, Optional
+
 import pandas as pd
-from urllib.parse import quote
+import streamlit as st
+from notion_client import Client as NotionClient
 from openai import OpenAI
+from pydantic import BaseModel, Field, ValidationError
 
-st.title("🎓 Research Question Generator")
-st.write(
-    "パネル/インタビュー要約から4視点（逆張り/飛ばし/トレードオフ幻像/アナロジー）で研究クエスチョンを生成し、"
-    "ご関心領域の観点（Entrepreneurship & Innovation / VC & Entrepreneurial Finance / Public Policy & Institutional Design / "
-    "Applied Econometrics / Cross-border Investment）を付与。新規性×実用性でスコアリングしてCSVを出力します。"
-)
+# ---------- Page setup ----------
+st.set_page_config(page_title="RQ Builder (Notes → Notion)", page_icon="🧪", layout="wide")
+st.title("🧪 Research Question Builder")
+st.caption("議事録から研究クエスチョン案を生成し、編集してNotionに保存します。")
 
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
-
-# ========= ユーティリティ =========
-@st.cache_data(show_spinner=False, ttl=600)
-def openalex_count(query: str) -> int:
-    url = f"https://api.openalex.org/works?search={quote(query)}&per_page=1"
+# ---------- Secrets / clients ----------
+def get_secret(key: str, default: Optional[str] = None) -> str:
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        return int(r.json().get("meta", {}).get("count", 0))
+        return st.secrets[key]
     except Exception:
-        return -1  # 不明
+        if default is not None:
+            return default
+        raise KeyError(f"Missing secret: {key}")
 
-@st.cache_data(show_spinner=False, ttl=600)
-def openalex_top_links(query: str, n: int = 3) -> list[dict]:
-    base = "https://api.openalex.org/works"
-    params = (
-        f"title.search={quote(query)}"
-        "&filter=type:journal-article,language:en,from_publication_date:2015-01-01"
-        f"&per_page={n}&sort=cited_by_count:desc"
+OPENAI_API_KEY = get_secret("OPENAI_API_KEY")
+NOTION_TOKEN = get_secret("NOTION_TOKEN")
+NOTION_DATABASE_ID = get_secret("NOTION_DATABASE_ID")
+
+oa_client = OpenAI(api_key=OPENAI_API_KEY)
+notion = NotionClient(auth=NOTION_TOKEN)
+
+# ---------- Sidebar options ----------
+with st.sidebar:
+    st.header("Settings")
+    model = st.selectbox(
+        "OpenAI model",
+        ["gpt-4.1-mini", "gpt-4.1", "o4-mini"],
+        index=0,
+        help="精度↔コストのバランスで選択してください。"
     )
-    url = f"{base}?{params}"
+    max_items = st.slider("生成件数（目安）", 3, 8, 6, help="実際の件数はモデル出力次第で前後します。")
+    st.markdown("---")
+    st.markdown("**Notion DB**")
+    st.code(NOTION_DATABASE_ID, language="text")
+
+# ---------- Input area ----------
+col1, col2 = st.columns(2)
+with col1:
+    notes = st.text_area(
+        "議事録をペースト",
+        height=300,
+        placeholder="ここに議事録テキストを貼り付けてください（日本語/英語どちらでも可）"
+    )
+with col2:
+    uploaded = st.file_uploader("またはテキストファイルをアップロード", type=["txt", "md"])
+    if uploaded and not notes:
+        try:
+            notes = uploaded.read().decode("utf-8")
+        except Exception:
+            notes = uploaded.read().decode("utf-8", errors="ignore")
+
+st.divider()
+
+# ---------- Structured output schema ----------
+class RQItem(BaseModel):
+    title_ja: str = Field(..., description="研究リサーチクエスチョン（日本語、1行）")
+    proposed_approach_ja: str = Field(..., description="方法論案（日本語、2〜4文）")
+    keywords_en: List[str] = Field(default_factory=list, description="英語キーワード（3〜7語）")
+
+class RQResponse(BaseModel):
+    source_summary: Optional[str] = None
+    items: List[RQItem]
+
+def extract_output_text(resp) -> str:
+    """
+    OpenAI Python SDK のバージョン差異を吸収してテキストを取り出す。
+    """
+    # Newer SDKs
+    if hasattr(resp, "output_text") and resp.output_text:
+        return resp.output_text
+    # Fallback: responses.create の生構造を辿る
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        items = r.json().get("results", [])
-        out = []
-        for it in items:
-            oid = it.get("id", "")  # e.g., https://openalex.org/W123...
-            title = (it.get("title") or "").strip()
-            doi = (it.get("doi") or "").strip()  # e.g., https://doi.org/...
-            olink = oid if oid else ""
-            dlink = doi if doi else ""
-            # 表示は「Title | OpenAlex | DOI(あれば)」
-            disp = title
-            links = [olink] + ([dlink] if dlink else [])
-            out.append({"title": disp, "links": " | ".join([l for l in links if l])})
-        return out
+        return resp.output[0].content[0].text
     except Exception:
-        return []
+        # 最後の手段：文字列化
+        return json.dumps(resp, ensure_ascii=False)
 
-def novelty_score_from_count(n: int) -> int:
-    if n < 0:   return 2
-    if n < 50:  return 5
-    if n < 150: return 4
-    if n < 400: return 3
-    if n < 1000:return 2
-    return 1
+# ---------- Generate ----------
+col_g1, col_g2 = st.columns([1, 3])
+with col_g1:
+    gen_btn = st.button("🔮 RQを生成", disabled=not bool(notes))
+with col_g2:
+    reset_btn = st.button("🧹 リセット")
 
-def openalex_search_url(query: str) -> str:
-    return f"https://api.openalex.org/works?search={quote(query)}"
+if reset_btn:
+    for k in list(st.session_state.keys()):
+        if k.startswith("rq_"):
+            del st.session_state[k]
+    st.rerun()
 
-def ask_gpt_utility(q: str, context: str) -> dict:
-    prompt = f"""
-以下の研究クエスチョンについて、ベンチャー投資家・政策立案者の実務にとっての有用性を5点満点で評価し、
-短い理由を1〜2文で述べてください。JSONで返してください（keys: score, reason）。
+if gen_btn:
+    with st.spinner("生成中..."):
+        schema = RQResponse.model_json_schema()
+        prompt = f"""
+あなたは政策×VC研究のアシスタントです。以下の議事録から、研究リサーチクエスチョン候補を日本語で作成してください。
+各候補について以下の項目を必ず埋めて、JSONで返します：
 
-[コンテキスト]
-{context}
+- title_ja：研究クエスチョン（日本語、1行）
+- proposed_approach_ja：方法論案（日本語、2〜4文。使用するデータ例・分析枠組み（例：DiD/IV/回帰不連続/質的比較等）・識別戦略の方向性をできる範囲で明示）
+- keywords_en：分類・検索用のキーワード（英語、3〜7語）
 
-[研究クエスチョン]
-{q}
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
+最低3件、最大{max_items}件程度を返してください。
+
+[議事録]
+{notes}
+""".strip()
+
+        try:
+            resp = oa_client.responses.create(
+                model=model,
+                input=prompt,
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {"name": "rq_payload", "schema": schema, "strict": True},
+                },
+            )
+            raw_text = extract_output_text(resp)
+            data = RQResponse.model_validate_json(raw_text)
+            st.session_state["rq_items"] = [it.model_dump() for it in data.items]
+            st.success("RQ候補を生成しました。下で編集できます。")
+        except ValidationError as ve:
+            st.error("JSONの構造検証に失敗しました。プロンプトを見直すか、もう一度お試しください。")
+            st.exception(ve)
+        except Exception as e:
+            st.error("生成中にエラーが発生しました。")
+            st.exception(e)
+
+# ---------- Edit table ----------
+if "rq_items" in st.session_state and st.session_state["rq_items"]:
+    st.subheader("📝 候補（編集可能）")
+
+    df = pd.DataFrame([
+        {
+            "select": True,
+            "Name": it["title_ja"],                          # 日本語RQ
+            "Proposed Approach": it["proposed_approach_ja"], # 日本語の方法論案
+            "Tags": ", ".join(it.get("keywords_en", [])),    # 英語キーワード（カンマ区切り）
+        }
+        for it in st.session_state["rq_items"]
+    ])
+
+    edited = st.data_editor(
+        df,
+        num_rows="dynamic",
+        use_container_width=True,
+        column_config={
+            "select": st.column_config.CheckboxColumn("選択", default=True),
+            "Name": st.column_config.TextColumn("Name（RQ・日本語）"),
+            "Proposed Approach": st.column_config.TextColumn("Proposed Approach（日本語）", width="medium"),
+            "Tags": st.column_config.TextColumn("Tags（英語・カンマ区切り）"),
+        },
+        key="rq_editor",
     )
-    txt = resp.choices[0].message.content.strip()
-    import json, re
-    try:
-        m = re.search(r"\{.*\}", txt, re.S)
-        data = json.loads(m.group(0)) if m else {}
-        score = int(data.get("score", 3))
-        reason = str(data.get("reason", "")).strip()[:200]
-    except Exception:
-        score, reason = 3, txt[:200]
-    score = max(1, min(5, score))
-    return {"score": score, "reason": reason}
 
-def ask_gpt_perspective_tags(q: str) -> list[str]:
-    """関心領域に照らしてどの視点が強いかタグ付け"""
-    prompt = f"""
-次の研究クエスチョンについて、以下の関心領域のうち該当するものを1〜3個、短い英語タグで返してください。
-返答はカンマ区切りのタグのみ（説明不要）。
+    st.divider()
+    st.caption("保存先 Notion DB: " + NOTION_DATABASE_ID)
 
-- Entrepreneurship & Innovation
-- Venture Capital & Entrepreneurial Finance
-- Public Policy & Institutional Design
-- Applied Econometrics
-- Cross-border Investment
+    # ---------- Save to Notion ----------
+    def to_multi_select_en(s: str):
+        tags = [t.strip() for t in (s or "").split(",") if t.strip()]
+        return [{"name": t} for t in tags]
 
-Question: {q}
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
-    )
-    tags = [t.strip() for t in resp.choices[0].message.content.split(",") if t.strip()]
-    return tags[:3]
+    if st.button("📤 選択したRQをNotionに保存"):
+        selected = edited[edited["select"] == True]
+        if selected.empty:
+            st.warning("保存対象がありません。")
+        else:
+            errors = []
+            success_count = 0
+            for _, row in selected.iterrows():
+                try:
+                    notion.pages.create(
+                        parent={"database_id": NOTION_DATABASE_ID},
+                        properties={
+                            # ---- ご指定スキーマに準拠 ----
+                            "Name": {"title": [{"text": {"content": (row["Name"] or "")[:200]}}]},
+                            "Gap Identified": {"rich_text": [{"text": {"content": "TBD"}}]},
+                            "Priority": {"select": {"name": "Medium"}},
+                            "Proposed Approach": {"rich_text": [{"text": {"content": row["Proposed Approach"] or ""}}]},
+                            "Rationale / Background": {"rich_text": [{"text": {"content": "TBD"}}]},
+                            "Status": {"select": {"name": "New"}},
+                            "Tags": {"multi_select": to_multi_select_en(row["Tags"])},
+                        },
+                    )
+                    success_count += 1
+                except Exception as e:
+                    errors.append(str(e))
 
-def generate_rqs(context: str) -> dict:
-    """4フレーム×各1問。関心領域を前置して生成を誘導。"""
-    prompt = f"""
-あなたはPhD研究支援アシスタントです。以下の関心領域の観点を常に意識して、議論要約から研究クエスチョンを作ってください：
-- Entrepreneurship & Innovation
-- Venture Capital & Entrepreneurial Finance
-- Public Policy & Institutional Design
-- Applied Econometrics
-- Cross-border Investment
+            if errors:
+                st.error("一部保存に失敗しました：\n" + "\n".join(errors))
+            if success_count:
+                st.success(f"{success_count}件をNotionに保存しました。")
 
-4つの発想フレームで各1問ずつ、日本語で簡潔に提示：
-1. 逆張り（前提を逆に見る）
-2. 飛ばし（手段Bを前提とせずAを達成する方法）
-3. トレードオフの幻想（AとBを同時達成できる条件）
-4. アナロジー（他分野への転用）
-
-出力形式：各行「<フレーム>：<クエスチョン>」のみ（説明文なし）。
-
-[議論要約]
-{context}
-"""
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.5,
-    )
-    out = resp.choices[0].message.content.strip()
-    lines = [l.strip("- ").strip() for l in out.splitlines() if l.strip()]
-    buckets = {"逆張り": "", "飛ばし": "", "トレードオフの幻想": "", "アナロジー": ""}
-    for k in list(buckets.keys()):
-        for l in lines:
-            if l.startswith(k):
-                q = l.split("：", 1)[-1].split(":", 1)[-1].strip()
-                buckets[k] = q or l
-                break
-    i = 0
-    for k in list(buckets.keys()):
-        if not buckets[k] and i < len(lines):
-            buckets[k] = lines[i]
-            i += 1
-    return buckets
-
-# ========= UI =========
-colA, colB = st.columns([3, 2])
-with colB:
-    st.markdown("**スコア重み**")
-    w_n = st.slider("新規性の重み", 0.0, 1.0, 0.6, 0.1)
-    w_u = 1.0 - w_n
-    st.caption(f"総合点 = 新規性×{w_n:.1f} + 実用性×{w_u:.1f}")
-with colA:
-    summary = st.text_area("議論の要約を入力してください", height=200)
-
-if st.button("生成 & スコアリング（CSV出力つき）"):
-    if not summary.strip():
-        st.warning("先に要約を入力してください。")
-    else:
-        with st.spinner("研究クエスチョンを生成中..."):
-            rqs = generate_rqs(summary)
-
-        rows = []
-        with st.spinner("スコア算出・リンク収集中..."):
-            for frame, q in rqs.items():
-                base_query = q if len(q) > 10 else (summary + " " + q)
-
-                # 新規性（OpenAlex件数）
-                count = openalex_count(base_query)
-                nov = novelty_score_from_count(count)
-                search_url = openalex_search_url(base_query)
-
-                # 上位論文リンク（OpenAlex / DOI）
-                top = openalex_top_links(base_query, n=3)
-                top_links = "; ".join([f"{t['title']} | {t['links']}" for t in top]) if top else ""
-
-                # 実用性（LLM）
-                util = ask_gpt_utility(q, summary)
-
-                # 関心領域タグ（LLM）
-                tags = ask_gpt_perspective_tags(q)
-
-                score = round(nov * w_n + util["score"] * w_u, 2)
-
-                rows.append({
-                    "発想フレーム": frame,
-                    "研究クエスチョン": q,
-                    "関心領域タグ": ", ".join(tags),
-                    "新規性(1-5)": nov,
-                    "実用性(1-5)": util["score"],
-                    "総合スコア": score,
-                    "実用性コメント": util["reason"],
-                    "OpenAlex件数(目安)": count if count >= 0 else "N/A",
-                    "OpenAlex検索URL": search_url,
-                    "関連上位論文": top_links,  # 「Title | OpenAlex | DOI」
-                })
-
-        df = pd.DataFrame(rows).sort_values("総合スコア", ascending=False).reset_index(drop=True)
-        st.subheader("🏁 ランキング（CSVにダウンロード可能）")
-        st.dataframe(df, use_container_width=True)
-
-        csv = df.to_csv(index=False).encode("utf-8-sig")
-
-        st.download_button(
-            "⬇️ CSVダウンロード（UTF-8対応）",
-            data=csv,
-            file_name="rq_ranked_with_links.csv",
-            mime="text/csv"
-        )
+# ---------- Footer ----------
+st.markdown("---")
+st.caption("© RQ Builder — Notes → JSON → Edit → Notion")
