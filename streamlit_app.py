@@ -19,7 +19,7 @@
 import json
 from typing import List, Optional
 from datetime import date
-
+import requests
 import pandas as pd
 import streamlit as st
 from notion_client import Client as NotionClient
@@ -49,6 +49,35 @@ NOTION_INTERVIEW_DB_ID = get_secret("NOTION_INTERVIEW_DB_ID")      # Interview N
 oa_client = OpenAI(api_key=OPENAI_API_KEY)
 notion = NotionClient(auth=NOTION_TOKEN)
 
+# -------- add safe database --------
+NOTION_VERSION = "2022-06-28"  # 安定版の日付
+
+def query_database_safe(notion, database_id: str, payload: dict | None = None):
+    """
+    1) notion.databases.query() を試す
+    2) AttributeError 等なら HTTP 生呼び出しで /v1/databases/{id}/query
+    """
+    payload = payload or {}
+    # 1) SDK 経由
+    try:
+        return notion.databases.query(database_id=database_id, **payload)
+    except AttributeError:
+        pass  # query が存在しない系
+    except Exception:
+        # SDK があるが別の理由で失敗 → 次の手段へ
+        pass
+
+    # 2) HTTP フォールバック
+    url = f"https://api.notion.com/v1/databases/{database_id}/query"
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    r = requests.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    return r.json()
+    
 # ---------- Common helpers ----------
 def normalize_keywords_en(v) -> List[str]:
     if v is None:
