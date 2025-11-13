@@ -26,6 +26,7 @@ from notion_client import Client as NotionClient
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError, AliasChoices
 from pydantic import ConfigDict
+from typing import List, Optional
 
 # ---------- Page setup ----------
 st.set_page_config(page_title="Interview → RQ Builder", page_icon="🗂️", layout="wide")
@@ -164,21 +165,28 @@ class INote(BaseModel):
     date_iso: str = Field(..., description="会議日（YYYY-MM-DD）", validation_alias=AliasChoices("date_iso", "date"))
     summary_ja: str = Field(..., description="日本語概要（200文字以内）", validation_alias=AliasChoices("summary_ja", "summary"))
 
-    # ▼ 既存（後方互換用）
+    # ▼ 新規：Interviewee（日本語名 or ローマ字表記でも可）
+    interviewee_ja: List[str] = Field(
+        default_factory=list,
+        description="被インタビュー者（配列、氏名/所属など）。例: ['山田 太郎（政策担当）','Jane Doe（VC Partner）']",
+        validation_alias=AliasChoices("interviewee_ja", "interviewees", "speakers", "participants"),
+    )
+
+    # ▼ 既存（後方互換の平坦箇条書き）
     transcript_bullets_ja: List[str] = Field(
         default_factory=list,
         description="日本語の箇条書き（平坦）",
         validation_alias=AliasChoices("transcript_bullets_ja", "transcript_bullets", "bullets"),
     )
 
-    # ▼ 追加：ツリー構造のMarkdown（こちらを優先使用）
+    # ▼ 既存：ツリー型Transcript（Markdown）
     transcript_md_ja: str = Field(
         ...,
         description="日本語の階層付き箇条書き（Markdown）。トップレベル8〜20項目、必要に応じて第2〜3階層。",
         validation_alias=AliasChoices("transcript_md_ja", "transcript_md", "transcript_markdown"),
     )
 
-    # すでに追加済みの英語タグ生成も維持
+    # ▼ 既存：英語タグ
     tags_en: List[str] = Field(
         default_factory=list,
         description="英語キーワードタグ（3〜8語）",
@@ -258,33 +266,37 @@ with tab1:
             schema = INoteResp.model_json_schema()
             today_iso = date.today().isoformat()
             prompt = f"""
-あなたは会議メモの整形アシスタントです。以下の「生メモ」から、
-(1) 会議題名（日本語）、(2) 日付（YYYY-MM-DD、文脈から推定。なければ {today_iso} を使用）、
-(3) 日本語の要約（200文字以内）、(4) 日本語の階層付き箇条書きTranscript（Markdown、詳しめ）、
-(5) 英語キーワードタグ（3〜8語；起業・VC・政策・計量・国際投資に関連）を生成し、
-次のJSON構造のみを返してください（マークダウンやコメント不要）。
+あなたは会議メモの整形アシスタントです。以下の「生メモ」から次を生成してください：
+(1) 会議題名（日本語）
+(2) 日付（YYYY-MM-DD、文脈から推定。なければ {today_iso} を使用）
+(3) 日本語の要約（200文字以内）
+(4) 日本語の階層付き箇条書きTranscript（Markdown、詳しめ）
+(5) 英語キーワードタグ（3〜8語；起業・VC・政策・計量・国際投資に関連）
+(6) 被インタビュー者（interviewee_ja：氏名/所属/役職などの配列。話者ラベルや固有名詞から推定。不明なら空配列）
 
-# 出力要件（Transcriptの詳細）
-- `transcript_md_ja` は **Markdownでの箇条書き**。トップレベル8〜20項目。
-- 可能な箇所は **第2階層（サブ論点）**、必要に応じて **第3階層（根拠・引用・数値・発言者）** を用いる。
+# Transcript 出力要件
+- `transcript_md_ja` は **Markdownの箇条書き**。トップレベル8〜20項目。
+- 可能な箇所に **第2階層（サブ論点）**、必要に応じ **第3階層（根拠・数値・引用・話者）**。
 - 書式例：
-  - `-` トップ論点（話者名や時刻が分かれば先頭に付記：`[00:12][山田] ...`）
+  - `-` トップ論点（可能なら `[00:12][山田] ...` のように時刻・話者）
     - `-` サブ論点
-      - `-` 根拠・数値・引用
-- 文末は簡潔に。重複は統合。憶測は明記（例：「仮説」）。
+      - `-` 根拠・数値・引用・出典
+- 重複は統合。憶測は明記（「仮説」）。
 - 個人情報や秘匿情報は伏せ字（例：「△△社」）。
 
-# JSON構造（このキー・順序で返す）
+# JSON構造（このキーと順序で返す。マークダウンやコメントは不要）
 {{
   "item": {{
     "name_ja": "...",
     "date_iso": "YYYY-MM-DD",
     "summary_ja": "... (<=200字)",
+    "interviewee_ja": ["山田 太郎（政策担当）","Jane Doe（VC Partner）"],
     "transcript_md_ja": "- ...\\n  - ...\\n    - ...",
-    "transcript_bullets_ja": ["...", "..."],  # 可能なら平坦な要約箇条書きも
+    "transcript_bullets_ja": ["...", "..."],
     "tags_en": ["entrepreneurship", "venture capital", "..."]
   }}
 }}
+
 
 [生メモ]
 {raw_memo}
@@ -295,23 +307,21 @@ with tab1:
                     st.subheader("🔎 受信JSON（デバッグ）")
                     st.json(raw_obj)
                 note = INoteResp.model_validate(raw_obj).item
-                
+
                 st.session_state["inote_name"] = note.name_ja
                 st.session_state["inote_date"] = note.date_iso
                 st.session_state["inote_summary"] = note.summary_ja
                 
-                # ▼ 優先：ツリー構造のMarkdown
+                # ツリー構造のTranscriptを優先
                 transcript_tree = (note.transcript_md_ja or "").strip()
-                
-                # ▼ フォールバック：平坦箇条書きがあれば成形
-                if not transcript_tree:
-                    if note.transcript_bullets_ja:
-                        transcript_tree = "- " + "\n- ".join([s.strip() for s in note.transcript_bullets_ja if str(s).strip()])
-                
-                # どちらかを Transcript フィールドに反映
+                if not transcript_tree and note.transcript_bullets_ja:
+                    transcript_tree = "- " + "\n- ".join([s.strip() for s in note.transcript_bullets_ja if str(s).strip()])
                 st.session_state["inote_transcript"] = transcript_tree
                 
-                # 英語タグも維持
+                # ▼ Interviewee（配列）→ カンマ区切りでUIに流し込む
+                st.session_state["inote_interviewee"] = ", ".join([x.strip() for x in note.interviewee_ja if str(x).strip()])
+                
+                # 英語タグ
                 st.session_state["inote_tags_en"] = ", ".join([t.strip() for t in note.tags_en if str(t).strip()])
                 st.success("生成しました。下で編集できます。")
 
@@ -334,9 +344,20 @@ with tab1:
     name_ja = st.text_input("Name（会議の題名・日本語）", value=st.session_state.get("inote_name", ""))
     date_iso = st.text_input("Date（YYYY-MM-DD）", value=st.session_state.get("inote_date", date.today().isoformat()))
     summary_ja = st.text_area("Summary（200字目安・日本語）", value=st.session_state.get("inote_summary", ""), height=100)
-    tags_en = st.text_input("Tags（英語・カンマ区切り。任意）", value=st.session_state.get("inote_tags_en", ""))
+    
+    # ▼ 追加：Interviewee（カンマ区切りで編集）
+    interviewee_csv = st.text_input(
+        "Interviewee（氏名/所属/役職など・カンマ区切り）",
+        value=st.session_state.get("inote_interviewee", "")
+    )
+    
+    tags_en = st.text_input(
+        "Tags（英語・カンマ区切り。任意）",
+        value=st.session_state.get("inote_tags_en", "")
+    )
+    
     transcript_ja = st.text_area(
-        "Transcript（日本語：詳しめの箇条書き）",
+        "Transcript（日本語：階層付き箇条書きMarkdown）",
         value=st.session_state.get("inote_transcript", ""),
         height=240
     )
@@ -352,10 +373,13 @@ with tab1:
                         "Name": {"title": [{"text": {"content": name_ja}}]},
                         "Date": {"date": {"start": date_iso}},
                         "Summary": {"rich_text": [{"text": {"content": summary_ja[:200]}}]},
+                        # ▼ 追加：Interviewee（Rich text。配列→カンマ区切り）
+                        "Interviewee": {"rich_text": [{"text": {"content": interviewee_csv}}]},
                         "Tags": {"multi_select": [{"name": t.strip()} for t in tags_en.split(",") if t.strip()]},
                         "Transcript": {"rich_text": [{"text": {"content": transcript_ja}}]},
                     },
                 )
+
                 st.success("Interview Notes に保存しました！")
             except Exception as e:
                 st.error(f"保存エラー: {e}")
@@ -383,7 +407,15 @@ with tab1:
             except Exception:
                 pass
         
+            interviewee_txt = ""
+            try:
+                interviewee_txt = "".join([t["plain_text"] for t in props["Interviewee"]["rich_text"]])
+            except Exception:
+                pass
+            
             with st.expander(f"📝 {title}"):
+                if interviewee_txt:
+                    st.markdown(f"**Interviewee:** {interviewee_txt}")
                 st.write(summary_txt or "_（No Summary）_")
                 colb1, colb2 = st.columns(2)
                 with colb1:
